@@ -1,0 +1,6 @@
+{
+  "name": "Cloudflare Telegram Proxy Deployer",
+  "description": "سامانه هوشمند دیپلوی خودکار پروکسی تلگرام در کلودفلر ورکر با تولید خودکار آی‌پی تمیز برای ایرانسل، همراه اول و آسیاتک",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
