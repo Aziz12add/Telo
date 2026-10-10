@@ -12,7 +12,9 @@ import {
   EyeOff, 
   ExternalLink,
   Zap,
-  Server
+  Server,
+  Lock,
+  Layers
 } from 'lucide-react';
 import { CloudflareAccount, DeployResponse } from '../types';
 
@@ -23,9 +25,10 @@ interface CloudflareDeployerProps {
   setAccountId: (id: string) => void;
   workerName: string;
   setWorkerName: (name: string) => void;
-  camouflageDomain: string;
-  setCamouflageDomain: (dom: string) => void;
-  secretHex: string;
+  proxySecret: string;
+  setProxySecret: (sec: string) => void;
+  customHostname: string;
+  setCustomHostname: (host: string) => void;
   generateNewSecret: () => void;
   onDeploy: (simulate?: boolean) => Promise<void>;
   isDeploying: boolean;
@@ -39,9 +42,10 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
   setAccountId,
   workerName,
   setWorkerName,
-  camouflageDomain,
-  setCamouflageDomain,
-  secretHex,
+  proxySecret,
+  setProxySecret,
+  customHostname,
+  setCustomHostname,
   generateNewSecret,
   onDeploy,
   isDeploying,
@@ -77,7 +81,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
         }
         setVerifyMessage({
           type: 'success',
-          text: `توکن معتبر است! ${data.accounts?.length ? `${data.accounts.length} اکانت شناسایی شد.` : 'دسترسی تأیید شد.'}`
+          text: `توکن تأیید شد! ${data.accounts?.length ? `${data.accounts.length} اکانت شناسایی شد.` : 'دسترسی فعال است.'}`
         });
       } else {
         setVerifyMessage({
@@ -100,26 +104,36 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 mb-6 pb-4 border-b border-slate-800/80">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
+          <div className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
             <Cloud className="w-5 h-5" />
           </div>
           <div>
             <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
-              <span>تنظیمات و دیپلوی در کلودفلر ورکر (Cloudflare Workers)</span>
+              <span>دیپلوی خودکار پروکسی تلگرام (Telo v2 + Durable Objects)</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-950 text-indigo-300 border border-indigo-700/60 font-mono">
+                Multipart ES Modules
+              </span>
             </h2>
             <p className="text-xs text-slate-400">
-              با وارد کردن توکن یا استفاده از دمو، ورکر پروکسی در کمتر از چند ثانیه فعال می‌شود.
+              دیپلوی ماژولار و استاندارد ورکر با قابلیت اتصال واقعی TCP به دیتاسنتر ۲ تلگرام (آمستردام)
             </p>
           </div>
         </div>
 
-        {/* Status indicator */}
         {deployResult?.success && (
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-xs font-medium">
             <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-            <span>دیپلوی فعال ({deployResult.isSimulated ? 'دمو' : 'سرور ابری'})</span>
+            <span>پروکسی مستقر شد ({deployResult.isSimulated ? 'دمو' : 'کلودفلر ابری'})</span>
           </div>
         )}
+      </div>
+
+      {/* Security Privacy Notice */}
+      <div className="mb-5 p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center gap-2.5 text-xs text-slate-400">
+        <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
+        <span>
+          <strong>حفظ امنیت توکن:</strong> توکن API کلودفلر در هیچ پایگاه‌داده‌ای ذخیره نمی‌شود و مستقیماً فقط در حافظه موقت تب جاری برای استقرار فراخوانی می‌گردد.
+        </span>
       </div>
 
       {/* Form Fields Grid */}
@@ -131,16 +145,16 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
               <Key className="w-3.5 h-3.5 text-amber-400" />
               <span>توکن API کلودفلر (API Token)</span>
             </label>
-            <span className="text-[11px] text-slate-500">نیاز به دسترسی Workers Scripts</span>
+            <span className="text-[11px] text-slate-500">دسترسی: Workers Scripts Edit</span>
           </div>
           <div className="relative flex items-center">
             <input
               id="cf-api-token"
               type={showToken ? 'text' : 'password'}
-              placeholder="مثال: q8rW1..._D9xLqA..."
+              placeholder="مثال: v8W3-X..._z99Q..."
               value={apiToken}
               onChange={(e) => setApiToken(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 pl-20 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 pl-24 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
             />
             <div className="absolute left-2 flex items-center gap-1">
               <button
@@ -155,9 +169,9 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
                 type="button"
                 onClick={handleVerifyToken}
                 disabled={isVerifying || !apiToken.trim()}
-                className="px-2 py-1 rounded text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-sky-400 disabled:opacity-50 transition"
+                className="px-2.5 py-1 rounded text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-sky-400 disabled:opacity-50 transition"
               >
-                {isVerifying ? '...' : 'بررسی'}
+                {isVerifying ? '...' : 'تأیید توکن'}
               </button>
             </div>
           </div>
@@ -175,7 +189,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
               <User className="w-3.5 h-3.5 text-sky-400" />
               <span>شناسه اکانت (Account ID)</span>
             </label>
-            <span className="text-[11px] text-slate-500">یا انتخاب خودکار از لیست</span>
+            <span className="text-[11px] text-slate-500">انتخاب از اکانت‌های شناسایی شده</span>
           </div>
           {accounts.length > 0 ? (
             <select
@@ -186,7 +200,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
             >
               {accounts.map((acc) => (
                 <option key={acc.id} value={acc.id}>
-                  {acc.name} ({acc.id.slice(0, 8)}...)
+                  {acc.name} ({acc.id.slice(0, 10)}...)
                 </option>
               ))}
             </select>
@@ -204,58 +218,47 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
 
         {/* Worker Script Name */}
         <div className="space-y-1.5">
-          <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-            <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-            <span>نام ورکر (Worker Name)</span>
-          </label>
-          <div className="flex items-center">
-            <input
-              id="cf-worker-name"
-              type="text"
-              placeholder="tg-worker-proxy"
-              value={workerName}
-              onChange={(e) => setWorkerName(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
-            />
-          </div>
-        </div>
-
-        {/* Camouflage Domain (TLS SNI) */}
-        <div className="space-y-1.5">
           <div className="flex items-center justify-between">
             <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-              <Server className="w-3.5 h-3.5 text-emerald-400" />
-              <span>دامنه استتار Fake TLS (SNI)</span>
+              <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+              <span>نام ورکر (Worker Name)</span>
             </label>
-            <span className="text-[11px] text-slate-500">جهت عبور از فیلترینگ</span>
+            <span className="text-[11px] text-slate-500">پیشوند استاندارد telo-</span>
           </div>
           <input
-            id="cf-camou-domain"
+            id="cf-worker-name"
             type="text"
-            placeholder="www.google.com"
-            value={camouflageDomain}
-            onChange={(e) => setCamouflageDomain(e.target.value)}
+            placeholder="telo-proxy"
+            value={workerName}
+            onChange={(e) => setWorkerName(e.target.value)}
             className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
           />
         </div>
-      </div>
 
-      {/* Secret Key Display & Refresh */}
-      <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-3.5 mb-6 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400">کلید رمزنگاری MTProto (Secret 32-hex):</span>
-          <span className="text-xs font-mono text-amber-300 bg-amber-950/50 px-2 py-0.5 rounded border border-amber-800/40">
-            {secretHex.slice(0, 16)}...{secretHex.slice(-8)}
-          </span>
+        {/* Proxy Secret */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+              <Layers className="w-3.5 h-3.5 text-emerald-400" />
+              <span>کلید سکرت پروکسی (32 کاراکتر Hex)</span>
+            </label>
+            <button
+              type="button"
+              onClick={generateNewSecret}
+              className="text-[11px] text-sky-400 hover:text-sky-300 transition flex items-center gap-1"
+            >
+              <RefreshCw className="w-3 h-3" />
+              <span>تولید تصادفی</span>
+            </button>
+          </div>
+          <input
+            id="cf-proxy-secret"
+            type="text"
+            value={proxySecret}
+            onChange={(e) => setProxySecret(e.target.value)}
+            className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+          />
         </div>
-        <button
-          type="button"
-          onClick={generateNewSecret}
-          className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200 transition"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>تولید کلید جدید</span>
-        </button>
       </div>
 
       {/* Error alert if any */}
@@ -263,7 +266,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
         <div className="mb-5 p-3.5 rounded-xl bg-rose-950/50 border border-rose-800/50 flex items-start gap-2.5 text-xs text-rose-300">
           <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
           <div>
-            <div className="font-semibold mb-0.5">خطا در دیپلوی:</div>
+            <div className="font-semibold mb-0.5">خطا در بارگذاری یا فعال‌سازی:</div>
             <div>{deployResult.error}</div>
           </div>
         </div>
@@ -278,10 +281,10 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
             </div>
             <div>
               <div className="text-xs font-bold text-emerald-300">
-                ورکر کلودفلر با موفقیت مستقر شد!
+                ورکر با موفقیت مستقر شد و روتینگ workers.dev فعال است!
               </div>
               <div className="text-xs text-slate-300 font-mono flex items-center gap-2 mt-0.5">
-                <span>آدرس ورکر:</span>
+                <span>دامنه مستقیم:</span>
                 <a 
                   href={deployResult.workerUrl} 
                   target="_blank" 
@@ -296,7 +299,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
           </div>
 
           <div className="text-xs text-slate-400">
-            پروکسی‌های اختصاصی ایرانسل، همراه اول و آسیاتک در بخش پایین آماده اتصال هستند 👇
+            لینک‌های پروکسی و تنظیمات اپراتورها در پایین آماده اتصال است 👇
           </div>
         </div>
       )}
@@ -312,12 +315,12 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
           {isDeploying ? (
             <>
               <RefreshCw className="w-4 h-4 animate-spin" />
-              <span>در حال دیپلوی در شبکه کلودفلر...</span>
+              <span>در حال ارسال پکیج ماژولار و تنظیم Durable Object...</span>
             </>
           ) : (
             <>
               <Sparkles className="w-4 h-4" />
-              <span>دیپلوی خودکار در کلودفلر (Auto Deploy)</span>
+              <span>دیپلوی خودکار پکیج در کلودفلر (Multipart Deploy)</span>
             </>
           )}
         </button>
@@ -329,7 +332,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
           className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-medium text-xs sm:text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
         >
           <Zap className="w-4 h-4 text-amber-400" />
-          <span>تست فوری (حالت دمو بدون توکن)</span>
+          <span>تست دمو (آزمایش سریع رابط و لینک‌ها)</span>
         </button>
       </div>
     </div>

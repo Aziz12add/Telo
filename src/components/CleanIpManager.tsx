@@ -8,7 +8,8 @@ import {
   Signal, 
   Zap, 
   MapPin,
-  Check
+  Check,
+  AlertCircle
 } from 'lucide-react';
 import { CleanIPItem, OperatorType } from '../types';
 
@@ -17,6 +18,7 @@ interface CleanIpManagerProps {
   operatorNameFa: string;
   cleanIps: CleanIPItem[];
   selectedIp: string;
+  workerDomain: string;
   onSelectIp: (ip: string) => void;
   onAddCustomIp: (ip: string) => void;
   onTestIp: (ipItem: CleanIPItem) => Promise<void>;
@@ -29,6 +31,7 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
   operatorNameFa,
   cleanIps,
   selectedIp,
+  workerDomain,
   onSelectIp,
   onAddCustomIp,
   onTestIp,
@@ -48,6 +51,8 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
     }
   };
 
+  const isDirectDomainSelected = selectedIp === workerDomain;
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-6 shadow-xl">
       {/* Header */}
@@ -55,10 +60,10 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
         <div>
           <h4 className="text-sm sm:text-base font-bold text-white flex items-center gap-2">
             <Signal className="w-4 h-4 text-sky-400" />
-            <span>آی‌پی‌های تمیز کلودفلر برای {operatorNameFa}</span>
+            <span>تنظیمات مسیریابی و آی‌پی‌های تمیز ({operatorNameFa})</span>
           </h4>
           <p className="text-xs text-slate-400 mt-0.5">
-            آی‌پی با کمترین پینگ را انتخاب کنید تا پروکسی بدون تأخیر متصل شود.
+            می‌توانید مستقیماً از دامنه ورکر یا آی‌پی‌های Anycast تست‌شده برای عبور از اختلالات اپراتور استفاده کنید.
           </p>
         </div>
 
@@ -70,7 +75,7 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 transition"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isTestingAll ? 'animate-spin text-sky-400' : ''}`} />
-            <span>{isTestingAll ? 'در حال تست پینگ...' : 'تست پینگ همه'}</span>
+            <span>{isTestingAll ? 'در حال تست...' : 'تست پینگ همه'}</span>
           </button>
 
           <button
@@ -79,9 +84,41 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
           >
             <Plus className="w-3.5 h-3.5 text-emerald-400" />
-            <span>افزودن آی‌پی دلخواه</span>
+            <span>افزودن آی‌پی اختصاصی</span>
           </button>
         </div>
+      </div>
+
+      {/* Direct Worker Domain Option */}
+      <div 
+        onClick={() => onSelectIp(workerDomain)}
+        className={`mb-4 p-3.5 rounded-xl border transition cursor-pointer flex items-center justify-between gap-3 ${
+          isDirectDomainSelected
+            ? 'bg-sky-950/50 border-sky-500 shadow-md'
+            : 'bg-slate-950/80 border-slate-800 hover:border-slate-700'
+        }`}
+      >
+        <div className="flex items-center gap-3">
+          <div className={`w-4 h-4 rounded-full flex items-center justify-center border transition ${
+            isDirectDomainSelected ? 'border-sky-400 bg-sky-400' : 'border-slate-600'
+          }`}>
+            {isDirectDomainSelected && <Check className="w-2.5 h-2.5 text-slate-950 font-bold" />}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-xs sm:text-sm font-semibold text-white">
+                {workerDomain}
+              </span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-semibold">
+                دامنه رسمی ورکر (پیشنهاد اصلی)
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">
+              مسیریابی مستقیم بدون واسطه به کلاسترهای لبه کلودفلر
+            </div>
+          </div>
+        </div>
+        <span className="text-xs text-sky-400 font-medium">اتصال مستقیم</span>
       </div>
 
       {/* Add Custom IP inline form */}
@@ -125,7 +162,6 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
                   : 'bg-slate-950/70 border-slate-800/80 hover:border-slate-700'
               }`}
             >
-              {/* Left Details */}
               <div className="flex items-center gap-3">
                 <div className={`w-4 h-4 rounded-full flex items-center justify-center border transition ${
                   isSelected ? 'border-sky-400 bg-sky-400' : 'border-slate-600'
@@ -140,7 +176,7 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
                     </span>
                     {item.recommended && (
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/70 text-amber-400 border border-amber-800/50 font-medium">
-                        پیشنهادی
+                        پایدار
                       </span>
                     )}
                   </div>
@@ -151,7 +187,6 @@ export const CleanIpManager: React.FC<CleanIpManagerProps> = ({
                 </div>
               </div>
 
-              {/* Right: Latency & Test button */}
               <div className="flex items-center gap-2 shrink-0">
                 {item.status === 'testing' ? (
                   <span className="text-[11px] text-sky-400 flex items-center gap-1 font-mono">

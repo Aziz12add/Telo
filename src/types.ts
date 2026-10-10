@@ -2,9 +2,8 @@ export interface CloudflareCredentials {
   apiToken: string;
   accountId: string;
   workerName: string;
-  secretHex: string;
-  camouflageDomain: string;
-  customDomain?: string;
+  proxySecret: string;
+  customHostname?: string;
 }
 
 export interface CloudflareAccount {
@@ -17,6 +16,7 @@ export interface DeployResponse {
   workerName?: string;
   workerUrl?: string;
   subdomain?: string;
+  secret?: string;
   message?: string;
   error?: string;
   deployedAt?: string;
@@ -48,5 +48,12 @@ export interface OperatorProxyConfig {
   secret: string;
   proxyLink: string;
   telegramDeepLink: string;
-  botApiUrl: string;
+  healthUrl: string;
+  protocolBadge: string;
+}
+
+export interface CloudflareWorkerScript {
+  id: string;
+  created_on: string;
+  modified_on: string;
 }

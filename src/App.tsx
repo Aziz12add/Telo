@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Header } from './components/Header';
 import { CloudflareDeployer } from './components/CloudflareDeployer';
 import { OperatorTabs } from './components/OperatorTabs';
@@ -12,10 +12,9 @@ import { CleanIpManager } from './components/CleanIpManager';
 import { WorkerCodeModal } from './components/WorkerCodeModal';
 import { HelpGuideModal } from './components/HelpGuideModal';
 import { BulkExportModal } from './components/BulkExportModal';
-import { INITIAL_CLEAN_IPS, generateTelegramSecret } from './data/cleanIps';
-import { generateWorkerCode } from './data/workerTemplate';
+import { INITIAL_CLEAN_IPS } from './data/cleanIps';
 import { CleanIPItem, DeployResponse, OperatorProxyConfig, OperatorType } from './types';
-import { Zap, ShieldCheck, CheckCircle2, ArrowDown, Activity } from 'lucide-react';
+import { Zap, ShieldCheck, CheckCircle2, ArrowDown, Activity, Sparkles } from 'lucide-react';
 
 function generateRandom32Hex(): string {
   if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
@@ -27,23 +26,24 @@ function generateRandom32Hex(): string {
 }
 
 export default function App() {
-  // Cloudflare Credentials & Config State
-  const [apiToken, setApiToken] = useState(() => localStorage.getItem('cf_api_token') || '');
-  const [accountId, setAccountId] = useState(() => localStorage.getItem('cf_account_id') || '');
-  const [workerName, setWorkerName] = useState('tg-worker-proxy');
-  const [camouflageDomain, setCamouflageDomain] = useState('www.google.com');
-  const [secretHex, setSecretHex] = useState(generateRandom32Hex);
+  // Cloudflare Credentials & Config State (In-memory, session-only for security)
+  const [apiToken, setApiToken] = useState('');
+  const [accountId, setAccountId] = useState('');
+  const [workerName, setWorkerName] = useState('telo-proxy');
+  const [proxySecret, setProxySecret] = useState(generateRandom32Hex);
+  const [customHostname, setCustomHostname] = useState('');
 
   // Deploy state
   const [isDeploying, setIsDeploying] = useState(false);
   const [deployResult, setDeployResult] = useState<DeployResponse | null>(() => {
-    // default demo active to provide instant working proxy links
+    const initialWorkerName = 'telo-proxy';
     return {
       success: true,
-      workerName: 'tg-worker-proxy',
-      workerUrl: 'https://tg-worker-proxy.iran-fast.workers.dev',
-      subdomain: 'iran-fast',
+      workerName: initialWorkerName,
+      workerUrl: `https://${initialWorkerName}.telo-iran.workers.dev`,
+      subdomain: 'telo-iran',
       isSimulated: true,
+      secret: 'e0e1e2e3e4e5e6e7e8e9eaebecedeeef',
       message: 'پروکسی آماده است. می‌توانید مستقیماً به تلگرام متصل شوید یا در کلودفلر شخصی دیپلوی کنید.'
     };
   });
@@ -64,32 +64,27 @@ export default function App() {
   const [isHelpOpen, setIsHelpOpen] = useState(false);
   const [isExportOpen, setIsExportOpen] = useState(false);
 
-  // Save credentials to localStorage
-  useEffect(() => {
-    if (apiToken) localStorage.setItem('cf_api_token', apiToken);
-  }, [apiToken]);
+  // Current active worker host
+  const activeWorkerHost = useMemo(() => {
+    if (deployResult?.workerUrl) {
+      try {
+        return new URL(deployResult.workerUrl).host;
+      } catch {
+        return deployResult.workerUrl.replace('https://', '').replace('/', '');
+      }
+    }
+    return `${workerName}.workers.dev`;
+  }, [deployResult, workerName]);
 
-  useEffect(() => {
-    if (accountId) localStorage.setItem('cf_account_id', accountId);
-  }, [accountId]);
-
-  // Compute Full Telegram Secret with TLS Fake SNI
-  const fullSecret = useMemo(() => {
-    return generateTelegramSecret(secretHex, camouflageDomain);
-  }, [secretHex, camouflageDomain]);
-
-  // Generate Current Worker Code
-  const currentWorkerCode = useMemo(() => {
-    return generateWorkerCode({
-      workerName: workerName.trim() || 'tg-worker-proxy',
-      camouflageDomain: camouflageDomain.trim() || 'www.google.com',
-      secretHex
-    });
-  }, [workerName, camouflageDomain, secretHex]);
+  // Clean MTProxy secret format (32 hex characters)
+  const effectiveSecret = useMemo(() => {
+    const base = (proxySecret || '').trim().toLowerCase().replace(/^dd/, '').replace(/^ee/, '');
+    return base.padEnd(32, '0').slice(0, 32);
+  }, [proxySecret]);
 
   // Operator configs with dynamic links
   const operatorConfigs = useMemo<Record<OperatorType, OperatorProxyConfig>>(() => {
-    const activeWorkerUrl = deployResult?.workerUrl || 'https://tg-worker-proxy.workers.dev';
+    const activeWorkerUrl = deployResult?.workerUrl || `https://${activeWorkerHost}`;
 
     const getOperatorConfig = (
       id: OperatorType,
@@ -99,12 +94,12 @@ export default function App() {
       badge: string
     ): OperatorProxyConfig => {
       const opsCleanIps = cleanIps.filter((item) => item.operator === id);
-      const selectedCleanIp = selectedIps[id] || (opsCleanIps[0] ? opsCleanIps[0].ip : '104.16.248.249');
+      const chosenIp = selectedIps[id] || activeWorkerHost;
 
-      // tg://proxy?server=IP&port=443&secret=SECRET
-      const telegramDeepLink = `tg://proxy?server=${selectedCleanIp}&port=443&secret=${fullSecret}`;
-      const proxyLink = `https://t.me/proxy?server=${selectedCleanIp}&port=443&secret=${fullSecret}`;
-      const botApiUrl = `${activeWorkerUrl}/bot<YOUR_BOT_TOKEN>`;
+      // Real MTProxy format: tg://proxy?server=HOST_OR_IP&port=443&secret=SECRET
+      const telegramDeepLink = `tg://proxy?server=${chosenIp}&port=443&secret=${effectiveSecret}`;
+      const proxyLink = `https://t.me/proxy?server=${chosenIp}&port=443&secret=${effectiveSecret}`;
+      const healthUrl = `${activeWorkerUrl}/healthz`;
 
       return {
         id,
@@ -113,11 +108,12 @@ export default function App() {
         color,
         badge,
         cleanIps: opsCleanIps,
-        selectedCleanIp,
-        secret: fullSecret,
+        selectedCleanIp: chosenIp,
+        secret: effectiveSecret,
         proxyLink,
         telegramDeepLink,
-        botApiUrl
+        healthUrl,
+        protocolBadge: 'MTProxy (AES-CTR)'
       };
     };
 
@@ -127,7 +123,7 @@ export default function App() {
       asiatech: getOperatorConfig('asiatech', 'آسیاتک', 'Asiatech ADSL/VDSL', '#6366f1', 'ASIA'),
       other: getOperatorConfig('other', 'سایر اپراتورها', 'TCI / Rightel / Shatel', '#10b981', 'ALL')
     };
-  }, [cleanIps, selectedIps, fullSecret, deployResult]);
+  }, [cleanIps, selectedIps, effectiveSecret, deployResult, activeWorkerHost]);
 
   // Handle Deploy Action
   const handleDeploy = async (simulate: boolean = false) => {
@@ -142,7 +138,8 @@ export default function App() {
           apiToken: apiToken.trim(),
           accountId: accountId.trim(),
           workerName: workerName.trim(),
-          scriptCode: currentWorkerCode,
+          proxySecret: effectiveSecret,
+          customHostname: customHostname.trim() || undefined,
           isSimulation: simulate
         })
       });
@@ -157,6 +154,7 @@ export default function App() {
           subdomain: data.subdomain,
           deployedAt: data.deployedAt,
           isSimulated: data.isSimulated,
+          secret: data.secret,
           message: data.message
         });
       } else {
@@ -220,11 +218,11 @@ export default function App() {
     setIsTestingAll(false);
   };
 
-  // Select clean IP for operator
-  const handleSelectIp = (ip: string) => {
+  // Select clean IP or domain for operator
+  const handleSelectIp = (ipOrDomain: string) => {
     setSelectedIps((prev) => ({
       ...prev,
-      [activeTab]: ip
+      [activeTab]: ipOrDomain
     }));
   };
 
@@ -262,21 +260,21 @@ export default function App() {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-8">
-        {/* Hero Notice */}
-        <div className="bg-gradient-to-r from-sky-900/30 via-indigo-900/20 to-slate-900/40 border border-sky-800/40 rounded-2xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
+        {/* Architecture Notice Banner */}
+        <div className="bg-gradient-to-r from-sky-950/40 via-indigo-950/30 to-slate-900/50 border border-sky-800/40 rounded-2xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
+            <div className="w-10 h-10 rounded-xl bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
               <Zap className="w-5 h-5" />
             </div>
             <div>
               <div className="text-xs sm:text-sm font-semibold text-white flex items-center gap-2">
-                <span>پروکسی‌های ضد فیلتر تلگرام با پروتکل MTProto و Fake TLS</span>
+                <span>معماری Telo v2: اتصال مستقیم به سرورهای رسمی تلگرام</span>
                 <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-mono">
-                  Anycast Cloudflare
+                  cloudflare:sockets TCP + DO
                 </span>
               </div>
               <p className="text-[11px] sm:text-xs text-slate-400 mt-0.5">
-                ترافیک تلگرام بر روی سرورهای ابری کلودفلر سوار شده و با آی‌پی‌های تمیز فرانکفورت و صوفیه به تلگرام هدایت می‌شود.
+                ترافیک از طریق سوکت‌های لبه کلودفلر مستقیماً به دیتاسنتر اصلی ۲ تلگرام (آمستردام: 149.154.167.51:443) ارسال می‌شود.
               </p>
             </div>
           </div>
@@ -286,7 +284,7 @@ export default function App() {
               onClick={() => setIsHelpOpen(true)}
               className="text-xs text-sky-400 hover:text-sky-300 underline font-medium"
             >
-              راهنمای راه‌اندازی و دریافت توکن
+              راهنمای راه‌اندازی و توکن
             </button>
           </div>
         </div>
@@ -300,10 +298,11 @@ export default function App() {
             setAccountId={setAccountId}
             workerName={workerName}
             setWorkerName={setWorkerName}
-            camouflageDomain={camouflageDomain}
-            setCamouflageDomain={setCamouflageDomain}
-            secretHex={secretHex}
-            generateNewSecret={() => setSecretHex(generateRandom32Hex())}
+            proxySecret={proxySecret}
+            setProxySecret={setProxySecret}
+            customHostname={customHostname}
+            setCustomHostname={setCustomHostname}
+            generateNewSecret={() => setProxySecret(generateRandom32Hex())}
             onDeploy={handleDeploy}
             isDeploying={isDeploying}
             deployResult={deployResult}
@@ -318,7 +317,7 @@ export default function App() {
                 <span>خروجی پروکسی‌های تلگرام به تفکیک اپراتور</span>
               </h2>
               <p className="text-xs text-slate-400">
-                اپراتور اینترنت خود را انتخاب کنید تا پروکسی بهینه‌شده با کمترین پینگ نمایش داده شود:
+                اپراتور اینترنت خود را انتخاب کنید تا لینک استاندارد تلگرام به همراه آی‌پی مناسب نمایش داده شود:
               </p>
             </div>
           </div>
@@ -332,7 +331,7 @@ export default function App() {
           {/* Active Operator Proxy Card */}
           <ProxyCard
             config={activeConfig}
-            workerUrl={deployResult?.workerUrl || 'https://tg-worker-proxy.workers.dev'}
+            workerUrl={deployResult?.workerUrl || `https://${activeWorkerHost}`}
           />
 
           {/* Clean IPs Manager for Active Operator */}
@@ -341,6 +340,7 @@ export default function App() {
             operatorNameFa={activeConfig.nameFa}
             cleanIps={activeConfig.cleanIps}
             selectedIp={activeConfig.selectedCleanIp}
+            workerDomain={activeWorkerHost}
             onSelectIp={handleSelectIp}
             onAddCustomIp={handleAddCustomIp}
             onTestIp={handleTestIp}
@@ -354,7 +354,7 @@ export default function App() {
       <footer className="border-t border-slate-900 bg-slate-950 py-6 text-center text-xs text-slate-500">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div>
-            سامانه دیپلوی خودکار پروکسی تلگرام کلودفلر ورکر | نسخه اختصاصی اپراتورهای ایران
+            Telo v2 | سامانه دیپلوی واقعی پروکسی تلگرام بر بستر کلودفلر ورکر و سوکت‌های Anycast
           </div>
           <div className="flex items-center gap-4 text-slate-400">
             <span>ایرانسل (Irancell)</span>
@@ -370,8 +370,8 @@ export default function App() {
       <WorkerCodeModal
         isOpen={isCodeOpen}
         onClose={() => setIsCodeOpen(false)}
-        workerCode={currentWorkerCode}
         workerName={workerName}
+        proxySecret={effectiveSecret}
       />
 
       <HelpGuideModal
@@ -383,7 +383,7 @@ export default function App() {
         isOpen={isExportOpen}
         onClose={() => setIsExportOpen(false)}
         operatorConfigs={operatorConfigs}
-        workerUrl={deployResult?.workerUrl || 'https://tg-worker-proxy.workers.dev'}
+        workerUrl={deployResult?.workerUrl || `https://${activeWorkerHost}`}
       />
     </div>
   );
