@@ -23,7 +23,6 @@ app.post('/api/cloudflare/verify', async (req: Request, res: Response) => {
   }
 
   try {
-    // 1. Check token status
     const verifyRes = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
       headers: {
         'Authorization': `Bearer ${apiToken.trim()}`,
@@ -41,7 +40,6 @@ app.post('/api/cloudflare/verify', async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Fetch Accounts
     const accountsRes = await fetch('https://api.cloudflare.com/client/v4/accounts', {
       headers: {
         'Authorization': `Bearer ${apiToken.trim()}`,
@@ -96,11 +94,17 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
     });
   }
 
+  // اعتبارسنجی کد اسکریپت
+  if (!scriptCode || typeof scriptCode !== 'string' || scriptCode.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      error: 'کد اسکریپت ورکر (scriptCode) نامعتبر یا خالی است.'
+    });
+  }
+
   const cleanWorkerName = (workerName || 'tg-proxy').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '-');
 
   try {
-    // 1. Deploy Script using Cloudflare Workers API
-    // Cloudflare Workers single-script upload requires application/javascript
     const uploadRes = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${accountId.trim()}/workers/scripts/${cleanWorkerName}`,
       {
@@ -124,7 +128,6 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
       });
     }
 
-    // 2. Fetch worker subdomain for this account
     let subdomain = '';
     try {
       const subRes = await fetch(
@@ -141,10 +144,9 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
         subdomain = subData.result.subdomain;
       }
     } catch {
-      // Subdomain fetch failed, will fallback
+      // Subdomain fetch failed, fallback
     }
 
-    // 3. Enable workers.dev subdomain routing for this script
     try {
       await fetch(
         `https://api.cloudflare.com/client/v4/accounts/${accountId.trim()}/workers/scripts/${cleanWorkerName}/subdomain`,
@@ -158,7 +160,7 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
         }
       );
     } catch {
-      // Non-fatal if subdomain assignment exists
+      // Non-fatal
     }
 
     const workerUrl = subdomain
@@ -181,7 +183,7 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
   }
 });
 
-// 3. TCP Latency Test to Clean IP on Port 443
+// 3. TCP Latency Test to Clean IP on Port 443 (Fixed with responded flag)
 app.post('/api/test-ip', (req: Request, res: Response) => {
   const { ip, port = 443 } = req.body;
 
@@ -189,6 +191,7 @@ app.post('/api/test-ip', (req: Request, res: Response) => {
     return res.status(400).json({ success: false, error: 'آی‌پی معتبر وارد نشده است.' });
   }
 
+  let responded = false;
   const start = Date.now();
   const socket = new net.Socket();
   const timeoutMs = 2500;
@@ -196,6 +199,8 @@ app.post('/api/test-ip', (req: Request, res: Response) => {
   socket.setTimeout(timeoutMs);
 
   socket.on('connect', () => {
+    if (responded) return;
+    responded = true;
     const latency = Date.now() - start;
     socket.destroy();
     return res.json({
@@ -208,6 +213,8 @@ app.post('/api/test-ip', (req: Request, res: Response) => {
   });
 
   socket.on('timeout', () => {
+    if (responded) return;
+    responded = true;
     socket.destroy();
     return res.json({
       success: false,
@@ -220,6 +227,8 @@ app.post('/api/test-ip', (req: Request, res: Response) => {
   });
 
   socket.on('error', (err) => {
+    if (responded) return;
+    responded = true;
     socket.destroy();
     return res.json({
       success: false,
@@ -234,11 +243,14 @@ app.post('/api/test-ip', (req: Request, res: Response) => {
   try {
     socket.connect(port, ip);
   } catch (err: any) {
-    return res.status(500).json({
-      success: false,
-      ip,
-      error: err.message
-    });
+    if (!responded) {
+      responded = true;
+      return res.status(500).json({
+        success: false,
+        ip,
+        error: err.message
+      });
+    }
   }
 });
 
@@ -248,7 +260,6 @@ app.get('/api/health', (req: Request, res: Response) => {
 });
 
 async function startServer() {
-  // Vite middleware in dev, static files in production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
