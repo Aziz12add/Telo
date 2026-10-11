@@ -3,132 +3,72 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
-import { Header } from './components/Header';
-import { CloudflareDeployer } from './components/CloudflareDeployer';
-import { OperatorTabs } from './components/OperatorTabs';
-import { ProxyCard } from './components/ProxyCard';
-import { CleanIpManager } from './components/CleanIpManager';
-import { WorkerCodeModal } from './components/WorkerCodeModal';
-import { HelpGuideModal } from './components/HelpGuideModal';
-import { BulkExportModal } from './components/BulkExportModal';
-import { INITIAL_CLEAN_IPS } from './data/cleanIps';
-import { CleanIPItem, DeployResponse, OperatorProxyConfig, OperatorType } from './types';
-import { Zap, ShieldCheck, CheckCircle2, ArrowDown, Activity, Sparkles } from 'lucide-react';
-
-function generateRandom32Hex(): string {
-  if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
-    const bytes = new Uint8Array(16);
-    window.crypto.getRandomValues(bytes);
-    return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  return Math.random().toString(16).substring(2, 18) + Math.random().toString(16).substring(2, 18);
-}
+import React, { useState } from 'react';
+import { WebProxyResultPanel } from './components/WebProxyResultPanel';
+import { 
+  Cloud, 
+  Key, 
+  User, 
+  Cpu, 
+  Sparkles, 
+  RefreshCw, 
+  Eye, 
+  EyeOff, 
+  Layers, 
+  AlertTriangle 
+} from 'lucide-react';
 
 export default function App() {
-  // Cloudflare Credentials & Config State (In-memory, session-only for security)
   const [apiToken, setApiToken] = useState('');
+  const [showToken, setShowToken] = useState(false);
+  const [accounts, setAccounts] = useState<{ id: string; name: string }[]>([]);
   const [accountId, setAccountId] = useState('');
-  const [workerName, setWorkerName] = useState('telo-proxy');
-  const [proxySecret, setProxySecret] = useState(generateRandom32Hex);
-  const [customHostname, setCustomHostname] = useState('');
+  const [workerName, setWorkerName] = useState('telo-webproxy');
+  const [proxySecret, setProxySecret] = useState('000102030405060708090a0b0c0d0e0f');
 
-  // Deploy state
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+
   const [isDeploying, setIsDeploying] = useState(false);
-  const [deployResult, setDeployResult] = useState<DeployResponse | null>(() => {
-    const initialWorkerName = 'telo-proxy';
-    return {
-      success: true,
-      workerName: initialWorkerName,
-      workerUrl: `https://${initialWorkerName}.telo-iran.workers.dev`,
-      subdomain: 'telo-iran',
-      isSimulated: true,
-      secret: 'e0e1e2e3e4e5e6e7e8e9eaebecedeeef',
-      message: 'پروکسی آماده است. می‌توانید مستقیماً به تلگرام متصل شوید یا در کلودفلر شخصی دیپلوی کنید.'
-    };
-  });
+  const [deployError, setDeployError] = useState<string | null>(null);
 
-  // Operators & Clean IPs State
-  const [activeTab, setActiveTab] = useState<OperatorType>('irancell');
-  const [cleanIps, setCleanIps] = useState<CleanIPItem[]>(INITIAL_CLEAN_IPS);
-  const [selectedIps, setSelectedIps] = useState<Record<OperatorType, string>>({
-    irancell: '188.114.97.3',
-    mci: '104.16.248.249',
-    asiatech: '104.19.240.25',
-    other: '104.21.32.10'
-  });
-  const [isTestingAll, setIsTestingAll] = useState(false);
+  const [deployResult, setDeployResult] = useState<{
+    hostname: string;
+    secret: string;
+    tmeLink: string;
+    tgLink: string;
+  } | null>(null);
 
-  // Modals state
-  const [isCodeOpen, setIsCodeOpen] = useState(false);
-  const [isHelpOpen, setIsHelpOpen] = useState(false);
-  const [isExportOpen, setIsExportOpen] = useState(false);
+  const handleVerifyToken = async () => {
+    if (!apiToken.trim()) return;
+    setIsVerifying(true);
+    setVerifyError(null);
 
-  // Current active worker host
-  const activeWorkerHost = useMemo(() => {
-    if (deployResult?.workerUrl) {
-      try {
-        return new URL(deployResult.workerUrl).host;
-      } catch {
-        return deployResult.workerUrl.replace('https://', '').replace('/', '');
+    try {
+      const res = await fetch('/api/cloudflare/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiToken: apiToken.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setAccounts(data.accounts || []);
+        if (data.accounts?.length > 0) {
+          setAccountId(data.accounts[0].id);
+        }
+      } else {
+        setVerifyError(data.error || 'Invalid token');
       }
+    } catch {
+      setVerifyError('Failed to verify token');
+    } finally {
+      setIsVerifying(false);
     }
-    return `${workerName}.workers.dev`;
-  }, [deployResult, workerName]);
+  };
 
-  // Clean MTProxy secret format (32 hex characters)
-  const effectiveSecret = useMemo(() => {
-    const base = (proxySecret || '').trim().toLowerCase().replace(/^dd/, '').replace(/^ee/, '');
-    return base.padEnd(32, '0').slice(0, 32);
-  }, [proxySecret]);
-
-  // Operator configs with dynamic links
-  const operatorConfigs = useMemo<Record<OperatorType, OperatorProxyConfig>>(() => {
-    const activeWorkerUrl = deployResult?.workerUrl || `https://${activeWorkerHost}`;
-
-    const getOperatorConfig = (
-      id: OperatorType,
-      nameFa: string,
-      nameEn: string,
-      color: string,
-      badge: string
-    ): OperatorProxyConfig => {
-      const opsCleanIps = cleanIps.filter((item) => item.operator === id);
-      const chosenIp = selectedIps[id] || activeWorkerHost;
-
-      // Real MTProxy format: tg://proxy?server=HOST_OR_IP&port=443&secret=SECRET
-      const telegramDeepLink = `tg://proxy?server=${chosenIp}&port=443&secret=${effectiveSecret}`;
-      const proxyLink = `https://t.me/proxy?server=${chosenIp}&port=443&secret=${effectiveSecret}`;
-      const healthUrl = `${activeWorkerUrl}/healthz`;
-
-      return {
-        id,
-        nameFa,
-        nameEn,
-        color,
-        badge,
-        cleanIps: opsCleanIps,
-        selectedCleanIp: chosenIp,
-        secret: effectiveSecret,
-        proxyLink,
-        telegramDeepLink,
-        healthUrl,
-        protocolBadge: 'MTProxy (AES-CTR)'
-      };
-    };
-
-    return {
-      irancell: getOperatorConfig('irancell', 'ایرانسل', 'Irancell / MTN', '#f59e0b', 'MTN'),
-      mci: getOperatorConfig('mci', 'همراه اول', 'MCI (Hamrah Aval)', '#06b6d4', 'MCI'),
-      asiatech: getOperatorConfig('asiatech', 'آسیاتک', 'Asiatech ADSL/VDSL', '#6366f1', 'ASIA'),
-      other: getOperatorConfig('other', 'سایر اپراتورها', 'TCI / Rightel / Shatel', '#10b981', 'ALL')
-    };
-  }, [cleanIps, selectedIps, effectiveSecret, deployResult, activeWorkerHost]);
-
-  // Handle Deploy Action
-  const handleDeploy = async (simulate: boolean = false) => {
+  const handleDeploy = async (isSimulation: boolean = false) => {
     setIsDeploying(true);
-    setDeployResult(null);
+    setDeployError(null);
 
     try {
       const res = await fetch('/api/cloudflare/deploy', {
@@ -138,253 +78,201 @@ export default function App() {
           apiToken: apiToken.trim(),
           accountId: accountId.trim(),
           workerName: workerName.trim(),
-          proxySecret: effectiveSecret,
-          customHostname: customHostname.trim() || undefined,
-          isSimulation: simulate
-        })
+          proxySecret: proxySecret.trim(),
+          isSimulation,
+        }),
       });
 
       const data = await res.json();
-
       if (data.success) {
         setDeployResult({
-          success: true,
-          workerName: data.workerName,
-          workerUrl: data.workerUrl,
-          subdomain: data.subdomain,
-          deployedAt: data.deployedAt,
-          isSimulated: data.isSimulated,
+          hostname: data.hostname,
           secret: data.secret,
-          message: data.message
+          tmeLink: data.tmeLink,
+          tgLink: data.tgLink,
         });
       } else {
-        setDeployResult({
-          success: false,
-          error: data.error || 'دیپلوی در کلودفلر ناموفق بود.'
-        });
+        setDeployError(data.error || 'Deployment failed');
       }
     } catch (err: any) {
-      setDeployResult({
-        success: false,
-        error: 'خطا در برقراری ارتباط با سرور: ' + (err.message || 'خطای ناشناخته')
-      });
+      setDeployError(err.message || 'Deployment error');
     } finally {
       setIsDeploying(false);
     }
   };
 
-  // Test single IP latency
-  const handleTestIp = async (targetItem: CleanIPItem) => {
-    setCleanIps((prev) =>
-      prev.map((item) => (item.id === targetItem.id ? { ...item, status: 'testing' } : item))
-    );
-
-    try {
-      const res = await fetch('/api/test-ip', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ip: targetItem.ip, port: 443 })
-      });
-
-      const data = await res.json();
-
-      setCleanIps((prev) =>
-        prev.map((item) => {
-          if (item.id === targetItem.id) {
-            return {
-              ...item,
-              latency: data.latency,
-              status: data.success ? (data.latency < 160 ? 'online' : 'slow') : 'offline'
-            };
-          }
-          return item;
-        })
-      );
-    } catch {
-      setCleanIps((prev) =>
-        prev.map((item) => (item.id === targetItem.id ? { ...item, status: 'offline', latency: null } : item))
-      );
-    }
-  };
-
-  // Test all IPs for current operator
-  const handleTestAllIps = async () => {
-    setIsTestingAll(true);
-    const currentIps = cleanIps.filter((item) => item.operator === activeTab);
-
-    for (const item of currentIps) {
-      await handleTestIp(item);
-    }
-    setIsTestingAll(false);
-  };
-
-  // Select clean IP or domain for operator
-  const handleSelectIp = (ipOrDomain: string) => {
-    setSelectedIps((prev) => ({
-      ...prev,
-      [activeTab]: ipOrDomain
-    }));
-  };
-
-  // Add custom clean IP
-  const handleAddCustomIp = (ip: string) => {
-    const newItem: CleanIPItem = {
-      id: `custom-${Date.now()}`,
-      ip,
-      operator: activeTab,
-      providerName: `آی‌پی اختصاصی (${operatorConfigs[activeTab].nameFa})`,
-      location: 'Custom Anycast',
-      latency: null,
-      status: 'untested'
-    };
-
-    setCleanIps((prev) => [newItem, ...prev]);
-    setSelectedIps((prev) => ({
-      ...prev,
-      [activeTab]: ip
-    }));
-  };
-
-  const activeConfig = operatorConfigs[activeTab];
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-sky-500 selection:text-white">
-      {/* Top Navigation */}
-      <Header
-        onOpenHelp={() => setIsHelpOpen(true)}
-        onOpenCode={() => setIsCodeOpen(true)}
-        onOpenExport={() => setIsExportOpen(true)}
-        isDeployed={!!deployResult?.success}
-        workerUrl={deployResult?.workerUrl || null}
-      />
-
-      {/* Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-8">
-        {/* Architecture Notice Banner */}
-        <div className="bg-gradient-to-r from-sky-950/40 via-indigo-950/30 to-slate-900/50 border border-sky-800/40 rounded-2xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* Top Header */}
+      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-40">
+        <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
-              <Zap className="w-5 h-5" />
+            <div className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
+              <Cloud className="w-5 h-5" />
             </div>
             <div>
-              <div className="text-xs sm:text-sm font-semibold text-white flex items-center gap-2">
-                <span>معماری Telo v2: اتصال مستقیم به سرورهای رسمی تلگرام</span>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-800/60 font-mono">
-                  cloudflare:sockets TCP + DO
-                </span>
-              </div>
-              <p className="text-[11px] sm:text-xs text-slate-400 mt-0.5">
-                ترافیک از طریق سوکت‌های لبه کلودفلر مستقیماً به دیتاسنتر اصلی ۲ تلگرام (آمستردام: 149.154.167.51:443) ارسال می‌شود.
+              <h1 className="text-lg font-bold text-white tracking-tight">
+                Telegram Web Proxy v1 Deployer
+              </h1>
+              <p className="text-xs text-slate-400">
+                Cloudflare Workers &bull; Durable Objects &bull; Direct Sockets
               </p>
             </div>
           </div>
+        </div>
+      </header>
 
-          <div className="flex items-center gap-2">
+      {/* Main Content */}
+      <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-8 space-y-6">
+        {/* Deployer Setup Card */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-7 shadow-xl space-y-5">
+          <h2 className="text-base font-bold text-white flex items-center gap-2">
+            <span>Cloudflare Workers Deployment</span>
+          </h2>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* API Token */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Key className="w-3.5 h-3.5 text-amber-400" />
+                <span>Cloudflare API Token</span>
+              </label>
+              <div className="relative flex items-center">
+                <input
+                  type={showToken ? 'text' : 'password'}
+                  placeholder="Paste API token..."
+                  value={apiToken}
+                  onChange={(e) => setApiToken(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 pl-20 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+                />
+                <div className="absolute left-1.5 flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowToken(!showToken)}
+                    className="p-1 rounded text-slate-400 hover:text-slate-200"
+                  >
+                    {showToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleVerifyToken}
+                    disabled={isVerifying || !apiToken.trim()}
+                    className="px-2 py-1 rounded text-[11px] font-medium bg-slate-800 text-sky-400 hover:bg-slate-700 disabled:opacity-50"
+                  >
+                    {isVerifying ? '...' : 'Verify'}
+                  </button>
+                </div>
+              </div>
+              {verifyError && (
+                <p className="text-[11px] text-rose-400 mt-1">{verifyError}</p>
+              )}
+            </div>
+
+            {/* Account ID */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <User className="w-3.5 h-3.5 text-sky-400" />
+                <span>Account ID</span>
+              </label>
+              {accounts.length > 0 ? (
+                <select
+                  value={accountId}
+                  onChange={(e) => setAccountId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+                >
+                  {accounts.map((acc) => (
+                    <option key={acc.id} value={acc.id}>
+                      {acc.name} ({acc.id.slice(0, 8)}...)
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  placeholder="Cloudflare account ID..."
+                  value={accountId}
+                  onChange={(e) => setAccountId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+                />
+              )}
+            </div>
+
+            {/* Worker Name */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Worker Script Name</span>
+              </label>
+              <input
+                type="text"
+                value={workerName}
+                onChange={(e) => setWorkerName(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+              />
+            </div>
+
+            {/* Proxy Secret */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Layers className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Proxy Secret (32 Hex Characters)</span>
+              </label>
+              <input
+                type="text"
+                value={proxySecret}
+                onChange={(e) => setProxySecret(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
+              />
+            </div>
+          </div>
+
+          {deployError && (
+            <div className="p-3.5 rounded-xl bg-rose-950/60 border border-rose-800/80 text-xs text-rose-300 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>{deployError}</div>
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div className="flex flex-wrap items-center gap-3 pt-2">
             <button
-              onClick={() => setIsHelpOpen(true)}
-              className="text-xs text-sky-400 hover:text-sky-300 underline font-medium"
+              onClick={() => handleDeploy(false)}
+              disabled={isDeploying || !apiToken.trim() || !accountId.trim()}
+              className="flex-1 min-w-[200px] flex items-center justify-center gap-2 py-3 px-5 rounded-xl font-semibold text-xs sm:text-sm bg-sky-600 hover:bg-sky-500 text-white shadow-lg shadow-sky-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition"
             >
-              راهنمای راه‌اندازی و توکن
+              {isDeploying ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>Deploying Multipart Bundle...</span>
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4" />
+                  <span>Deploy to Cloudflare Workers</span>
+                </>
+              )}
+            </button>
+
+            <button
+              onClick={() => handleDeploy(true)}
+              disabled={isDeploying}
+              className="py-3 px-4 rounded-xl font-medium text-xs sm:text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+            >
+              Quick Test (Simulation)
             </button>
           </div>
         </div>
 
-        {/* Section 1: Cloudflare Deployer Console */}
-        <section id="section-deployer">
-          <CloudflareDeployer
-            apiToken={apiToken}
-            setApiToken={setApiToken}
-            accountId={accountId}
-            setAccountId={setAccountId}
-            workerName={workerName}
-            setWorkerName={setWorkerName}
-            proxySecret={proxySecret}
-            setProxySecret={setProxySecret}
-            customHostname={customHostname}
-            setCustomHostname={setCustomHostname}
-            generateNewSecret={() => setProxySecret(generateRandom32Hex())}
-            onDeploy={handleDeploy}
-            isDeploying={isDeploying}
-            deployResult={deployResult}
+        {/* Deployment Result Panel */}
+        {deployResult && (
+          <WebProxyResultPanel
+            hostname={deployResult.hostname}
+            secret={deployResult.secret}
+            tmeLink={deployResult.tmeLink}
+            tgLink={deployResult.tgLink}
           />
-        </section>
-
-        {/* Section 2: Operator Selection & Output */}
-        <section id="section-proxies" className="space-y-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
-                <span>خروجی پروکسی‌های تلگرام به تفکیک اپراتور</span>
-              </h2>
-              <p className="text-xs text-slate-400">
-                اپراتور اینترنت خود را انتخاب کنید تا لینک استاندارد تلگرام به همراه آی‌پی مناسب نمایش داده شود:
-              </p>
-            </div>
-          </div>
-
-          {/* Operator Tabs */}
-          <OperatorTabs
-            activeTab={activeTab}
-            onSelectTab={(tab) => setActiveTab(tab)}
-          />
-
-          {/* Active Operator Proxy Card */}
-          <ProxyCard
-            config={activeConfig}
-            workerUrl={deployResult?.workerUrl || `https://${activeWorkerHost}`}
-          />
-
-          {/* Clean IPs Manager for Active Operator */}
-          <CleanIpManager
-            operator={activeTab}
-            operatorNameFa={activeConfig.nameFa}
-            cleanIps={activeConfig.cleanIps}
-            selectedIp={activeConfig.selectedCleanIp}
-            workerDomain={activeWorkerHost}
-            onSelectIp={handleSelectIp}
-            onAddCustomIp={handleAddCustomIp}
-            onTestIp={handleTestIp}
-            onTestAllIps={handleTestAllIps}
-            isTestingAll={isTestingAll}
-          />
-        </section>
+        )}
       </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-6 text-center text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div>
-            Telo v2 | سامانه دیپلوی واقعی پروکسی تلگرام بر بستر کلودفلر ورکر و سوکت‌های Anycast
-          </div>
-          <div className="flex items-center gap-4 text-slate-400">
-            <span>ایرانسل (Irancell)</span>
-            <span>•</span>
-            <span>همراه اول (MCI)</span>
-            <span>•</span>
-            <span>آسیاتک (Asiatech)</span>
-          </div>
-        </div>
-      </footer>
-
-      {/* Modals */}
-      <WorkerCodeModal
-        isOpen={isCodeOpen}
-        onClose={() => setIsCodeOpen(false)}
-        workerName={workerName}
-        proxySecret={effectiveSecret}
-      />
-
-      <HelpGuideModal
-        isOpen={isHelpOpen}
-        onClose={() => setIsHelpOpen(false)}
-      />
-
-      <BulkExportModal
-        isOpen={isExportOpen}
-        onClose={() => setIsExportOpen(false)}
-        operatorConfigs={operatorConfigs}
-        workerUrl={deployResult?.workerUrl || `https://${activeWorkerHost}`}
-      />
     </div>
   );
 }
