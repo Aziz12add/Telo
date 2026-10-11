@@ -1,66 +1,111 @@
-# Telo v2 — Cloudflare Workers Telegram Proxy Deployer
+# Telo — Telegram Official WEB Proxy v1 Deployer on Cloudflare Workers
 
-Telo v2 is a full-stack deployer and production runtime for running a high-performance Telegram proxy on **Cloudflare Workers** using modern `cloudflare:sockets` TCP connections, Durable Objects session state, and MTProxy AES-CTR obfuscation.
+Telo is an automated deployer and production runtime for the official **Telegram WEB Proxy v1** on **Cloudflare Workers**.
 
 ---
 
 ## 🇮🇷 راهنمای فارسی (Persian Documentation)
 
-### چرا نسخه قدیمی کار نمی‌کرد؟
-نسخه اولیه پروژه فقط یک تونل ساده WebSocket به TCP بود و پروتکل کلاینت MTProto تلگرام را تفکیک یا رمزنگاری نمی‌کرد. در نسخه دوم (Telo v2):
-1. ورکر به صورت یک پکیج ماژولار کامل (شامل `index.js`, `session.js`, `mtproxy.js`, `protocol.js` و `metadata.json`) با متد استاندارد `multipart/form-data` در کلودفلر بارگذاری می‌شود.
-2. با استفاده از قابلیت مدرن `cloudflare:sockets` ارتباط مستقیم TCP به سرورهای رسمی تلگرام (دیتاسنتر اصلی ۲ در آمستردام: `149.154.167.51:443`) برقرار می‌شود.
-3. کلاس `ProxySessionDO` بر بستر Durable Objects مدیریت سشن‌ها، جریان داده و بافرها را به طور اختصاصی کنترل می‌کند.
-4. توکن‌های API کلودفلر فقط در حافظه رم نگهداری شده و هرگز در هیچ پایگاه‌داده‌ای ذخیره نمی‌شوند.
+### Telo چیست؟
+تلو (Telo) یک استقراردهنده خودکار و ران‌تایم رسمی برای **Telegram WEB Proxy v1** بر روی بسترهای سرورلس **Cloudflare Workers** است. این پروژه بر اساس پروتکل باینری اختصاصی تلگرام (بیگ‌اندین، فریم‌های باینری، هندشیک قابلیت بریج با HMAC-SHA256، و ارتباط سوکت مستقیم TCP به دیتاسنترهای رسمی تلگرام بر روی پورت 443 با Durable Objects) کار می‌کند.
 
-### راهنمای دریافت توکن Cloudflare API (طی ۳۰ ثانیه):
-1. وارد داشبورد کلودفلر شده و به صفحه توکن‌ها بروید:
+### اتصال در تلگرام (تنها روش معتبر)
+کاربران **تنها** از طریق نوع پروکسی **WEB Proxy** در تلگرام متصل می‌شوند (نه SOCKS5 و نه پورت‌های MTProto کلاسیک VPS):
+- **لینک مستقیم تحت وب:**
+  ```text
+  https://t.me/webproxy?server=<hostname>&secret=<secret>
+  ```
+- **لینک درون‌برنامه‌ای تلگرام:**
+  ```text
+  tg://webproxy?server=<hostname>&secret=<secret>
+  ```
+
+> **نکته مهم:** پارامتر `hostname` صرفاً نام دامنه ورکر است (مثلاً `my-proxy.my-subdomain.workers.dev`) بدون پیشوند `https://` و بدون مسیر اضافی. کلاینت تلگرام روی پورت استاندارد **443** به این ورکر وصل می‌شود.
+
+### نحوه تنظیم دستی در تلگرام
+اگر نمی‌خواهید روی لینک کلیک کنید:
+1. در برنامه تلگرام به مسیر زیر بروید:
+   **Settings &rarr; Data and Storage &rarr; Proxy Settings &rarr; Add Proxy**
+   (تنظیمات &rarr; داده‌ها و حافظه &rarr; تنظیمات پروکسی &rarr; افزودن پروکسی)
+2. نوع پروکسی را حتماً روی **WEB Proxy** قرار دهید.
+3. در کادر **Server**: نام دامنه ورکر (Hostname) را وارد کنید.
+4. در کادر **Secret**: کلید سکرت ۳۲ کاراکتری هگزادسیمال را وارد کنید.
+5. ذخیره کنید.
+
+### مراحل ایجاد توکن API کلودفلر (طی ۳۰ ثانیه):
+1. وارد داشبورد کلودفلر و بخش توکن‌ها شوید:
    [https://dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
 2. روی دکمه **Create Token** کلیک کنید.
-3. در قالب **Edit Cloudflare Workers** روی **Use template** کلیک کنید.
-4. اطمینان حاصل کنید دسترسی‌های زیر وجود دارند:
-   - `Account` -> `Workers Scripts` -> `Edit`
-   - `Account` -> `Workers Subdomain` -> `Edit`
-   - `Account` -> `Account Settings` -> `Read`
-5. دکمه **Continue to summary** و سپس **Create Token** را بزنید و توکن تولید شده را در برنامه وارد کنید.
+3. قالب پیش‌فرض **Edit Cloudflare Workers** را انتخاب کنید.
+4. دسترسی‌های زیر را تأیید نمایید:
+   - `Account` &gt; `Workers Scripts` &gt; `Edit`
+   - `Account` &gt; `Workers Subdomain` &gt; `Edit`
+   - `Account` &gt; `Account Settings` &gt; `Read`
+5. دکمه **Continue to summary** و سپس **Create Token** را زده و توکن را در پنل Telo وارد کنید.
 
-### نحوه اتصال در تلگرام
-پس از زدن دکمه دیپلوی، لینک‌های استاندارد تلگرام به صورت زیر تولید می‌شوند:
-- **لینک مستقیم:** `tg://proxy?server=YOUR_WORKER.workers.dev&port=443&secret=32_HEX_SECRET`
-- **لینک تحت وب:** `https://t.me/proxy?server=YOUR_WORKER.workers.dev&port=443&secret=32_HEX_SECRET`
-- **سنجش زنده سلامت:** `https://YOUR_WORKER.workers.dev/healthz`
+### چک‌لیست استقرار (Deploy Flow):
+1. اجرای برنامه و باز کردن پنل Telo
+2. وارد کردن Cloudflare API Token و زدن دکمه **Verify**
+3. انتخاب اکانت و زدن دکمه **Deploy to Cloudflare Workers**
+4. پس از چند ثانیه، نام هاست و لینک‌های اتصال نمایش داده می‌شوند.
 
-### محدودیت‌ها و قوانین کلودفلر (Cloudflare Terms of Service)
-- در پلن رایگان کلودفلر (Workers Free)، محدودیت ۱۰۰,۰۰۰ درخواست در روز وجود دارد که برای چت، چنل‌ها و دانلود فایل‌های عادی مناسب است.
-- تماس صوتی و تصویری تلگرام معمولاً بر بستر پروتکل UDP بوده و از مسیر P2P تلگرام می‌گذرد.
+### محدودیت‌ها و نکات فنی:
+- **سهمیه پلن رایگان:** پلن رایگان کلودفلر روزانه ۱۰۰,۰۰۰ درخواست به شما می‌دهد که برای چت و فایل‌های معمولی روزمره کافیست.
+- **تماس‌های صوتی و تصویری:** تماس‌های تلگرام عمدتاً بر پایه UDP P2P هستند و ممکن است از پروکسی وب TCP عبور نکنند.
+- **کنترل دسترسی:** دسترسی به ورکر با کلید Secret و اعتبارسنجی HMAC قفل شده است؛ هرگونه درخواست متفرقه یا فیلترچی یک صفحه خنثی (Decoy Page) دریافت می‌کند.
 
 ---
 
 ## 🇬🇧 English Documentation
 
-### Architecture Overview
-Telo v2 utilizes Cloudflare Workers' latest capabilities:
-- **Direct TCP Sockets**: Connects directly to official Telegram data centers (`149.154.175.50:443`, `149.154.167.51:443`, etc.) using `cloudflare:sockets`.
-- **Durable Objects (SQLite storage)**: Isolates client sessions in `ProxySessionDO` with window credit flow control and ingress/egress stream backpressure.
-- **Multipart Upload**: Deploys via Cloudflare v4 REST API using standard `multipart/form-data` with `metadata.json`, module bindings, and secret bindings.
-- **MTProxy Crypto Engine**: Implements the 64-byte client handshake parsing and streaming AES-256-CTR cipher.
-- **Zero-Storage Security**: Cloudflare API tokens are held strictly in memory for the single deploy request.
+### What is Telo?
+Telo deploys an official **Telegram WEB Proxy v1** runtime to **Cloudflare Workers**. It implements:
+- Big-Endian binary frame codec (`HELLO`, `WELCOME`, `OPEN`, `DATA`, `CLOSE`, `WINDOW`, `PING`, `PONG`).
+- Stream multiplexing and backpressure control using Cloudflare **Durable Objects** (`ProxySessionDO`).
+- Direct TCP socket tunneling to Telegram Official Data Centers (`149.154.175.50:443`, `149.154.167.51:443`, etc.) using `cloudflare:sockets`.
+- Decoy page masking for requests lacking the valid HMAC bridge capability token.
 
-### Telegram Data Centers Map:
-- **DC1**: `149.154.175.50:443` (Miami)
-- **DC2**: `149.154.167.51:443` (Amsterdam - Default European & Iranian traffic routing)
-- **DC3**: `149.154.175.100:443` (Miami)
-- **DC4**: `149.154.167.91:443` (Amsterdam)
-- **DC5**: `91.108.56.165:443` (Singapore)
+### Connection Format
+Telegram connects exclusively via the **WEB Proxy** protocol:
+- **Web Link:**
+  ```text
+  https://t.me/webproxy?server=<hostname>&secret=<secret>
+  ```
+- **Deep Link:**
+  ```text
+  tg://webproxy?server=<hostname>&secret=<secret>
+  ```
+
+> `hostname` must be provided without `https://` and without any URL path (e.g. `telo-worker.subdomain.workers.dev`). Telegram connects directly over port **443**.
+
+### In-App Telegram Configuration
+1. Open Telegram: **Settings &rarr; Data and Storage &rarr; Proxy Settings &rarr; Add Proxy**.
+2. Select **WEB Proxy**.
+3. Enter your **Server** (Worker hostname) and **Secret** (32 hex characters).
+4. Tap Save and Connect.
+
+### Cloudflare API Token Permissions
+Create a custom token or use the template at [https://dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens):
+- `Account` &gt; `Workers Scripts` &gt; `Edit`
+- `Account` &gt; `Workers Subdomain` &gt; `Edit`
+- `Account` &gt; `Account Settings` &gt; `Read`
 
 ### Local Development
 ```bash
+# 1. Install dependencies
 npm install
+
+# 2. Run dev server (Express backend + Vite frontend)
 npm run dev
+
+# 3. Build for production
+npm run build
+
+# 4. Start production server
+npm run start
 ```
 
-Build for production:
-```bash
-npm run build
-npm start
-```
+### Limitations & Cloudflare ToS
+- Cloudflare Workers Free plan has a limit of 100,000 requests/day.
+- Telegram voice and video calls use UDP peer-to-peer and will generally bypass web proxies.
+- Do not use for automated bulk abusive traffic.

@@ -5,18 +5,14 @@ import {
   User, 
   Cpu, 
   Sparkles, 
-  CheckCircle2, 
-  AlertTriangle, 
   RefreshCw, 
   Eye, 
   EyeOff, 
-  ExternalLink,
-  Zap,
-  Server,
-  Lock,
-  Layers
+  Layers, 
+  AlertTriangle,
+  ShieldCheck
 } from 'lucide-react';
-import { CloudflareAccount, DeployResponse } from '../types';
+import { CloudflareAccount } from '../types';
 
 interface CloudflareDeployerProps {
   apiToken: string;
@@ -27,12 +23,14 @@ interface CloudflareDeployerProps {
   setWorkerName: (name: string) => void;
   proxySecret: string;
   setProxySecret: (sec: string) => void;
-  customHostname: string;
-  setCustomHostname: (host: string) => void;
   generateNewSecret: () => void;
-  onDeploy: (simulate?: boolean) => Promise<void>;
+  onDeploy: (isSimulation?: boolean) => Promise<void>;
   isDeploying: boolean;
-  deployResult: DeployResponse | null;
+  deployError: string | null;
+  accounts: CloudflareAccount[];
+  isVerifying: boolean;
+  verifyError: string | null;
+  onVerifyToken: () => Promise<void>;
 }
 
 export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
@@ -44,159 +42,98 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
   setWorkerName,
   proxySecret,
   setProxySecret,
-  customHostname,
-  setCustomHostname,
   generateNewSecret,
   onDeploy,
   isDeploying,
-  deployResult
+  deployError,
+  accounts,
+  isVerifying,
+  verifyError,
+  onVerifyToken,
 }) => {
   const [showToken, setShowToken] = useState(false);
-  const [isVerifying, setIsVerifying] = useState(false);
-  const [accounts, setAccounts] = useState<CloudflareAccount[]>([]);
-  const [verifyMessage, setVerifyMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  const handleVerifyToken = async () => {
-    if (!apiToken.trim()) {
-      setVerifyMessage({ type: 'error', text: 'لطفاً ابتدا توکن API کلودفلر را وارد کنید.' });
-      return;
-    }
-
-    setIsVerifying(true);
-    setVerifyMessage(null);
-
-    try {
-      const res = await fetch('/api/cloudflare/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiToken: apiToken.trim() })
-      });
-
-      const data = await res.json();
-
-      if (data.success) {
-        setAccounts(data.accounts || []);
-        if (data.accounts && data.accounts.length > 0 && !accountId) {
-          setAccountId(data.accounts[0].id);
-        }
-        setVerifyMessage({
-          type: 'success',
-          text: `توکن تأیید شد! ${data.accounts?.length ? `${data.accounts.length} اکانت شناسایی شد.` : 'دسترسی فعال است.'}`
-        });
-      } else {
-        setVerifyMessage({
-          type: 'error',
-          text: data.error || 'توکن نامعتبر است. دسترسی Workers Scripts:Edit الزامی است.'
-        });
-      }
-    } catch {
-      setVerifyMessage({
-        type: 'error',
-        text: 'خطا در برقراری ارتباط با سرور جهت اعتبارسنجی.'
-      });
-    } finally {
-      setIsVerifying(false);
-    }
-  };
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 sm:p-7 shadow-xl">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-6 pb-4 border-b border-slate-800/80">
+    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 sm:p-7 shadow-xl space-y-6">
+      {/* Title & info */}
+      <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-800">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl bg-sky-500/10 border border-sky-500/30 flex items-center justify-center text-sky-400">
             <Cloud className="w-5 h-5" />
           </div>
           <div>
             <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
-              <span>دیپلوی خودکار پروکسی تلگرام (Telo v2 + Durable Objects)</span>
+              <span>Cloudflare Workers Deployment</span>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-950 text-indigo-300 border border-indigo-700/60 font-mono">
-                Multipart ES Modules
+                Multipart ES Modules + DO
               </span>
             </h2>
             <p className="text-xs text-slate-400">
-              دیپلوی ماژولار و استاندارد ورکر با قابلیت اتصال واقعی TCP به دیتاسنتر ۲ تلگرام (آمستردام)
+              Deploys official Telegram WEB Proxy v1 with Durable Objects and Direct TCP sockets
             </p>
           </div>
         </div>
 
-        {deployResult?.success && (
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 text-xs font-medium">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-            <span>پروکسی مستقر شد ({deployResult.isSimulated ? 'دمو' : 'کلودفلر ابری'})</span>
-          </div>
-        )}
+        <div className="flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-950/60 border border-emerald-800/80 px-3 py-1.5 rounded-xl font-medium">
+          <ShieldCheck className="w-4 h-4" />
+          <span>Zero Server Storage &bull; In-Memory Only</span>
+        </div>
       </div>
 
-      {/* Security Privacy Notice */}
-      <div className="mb-5 p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center gap-2.5 text-xs text-slate-400">
-        <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
-        <span>
-          <strong>حفظ امنیت توکن:</strong> توکن API کلودفلر در هیچ پایگاه‌داده‌ای ذخیره نمی‌شود و مستقیماً فقط در حافظه موقت تب جاری برای استقرار فراخوانی می‌گردد.
-        </span>
-      </div>
-
-      {/* Form Fields Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6">
-        {/* API Token Input */}
+      {/* Grid Inputs */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* API Token */}
         <div className="space-y-1.5">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+          <label className="text-xs font-semibold text-slate-300 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
               <Key className="w-3.5 h-3.5 text-amber-400" />
-              <span>توکن API کلودفلر (API Token)</span>
-            </label>
-            <span className="text-[11px] text-slate-500">دسترسی: Workers Scripts Edit</span>
-          </div>
+              <span>Cloudflare API Token</span>
+            </span>
+            <span className="text-[11px] text-slate-500">Workers Scripts Edit</span>
+          </label>
           <div className="relative flex items-center">
             <input
-              id="cf-api-token"
               type={showToken ? 'text' : 'password'}
-              placeholder="مثال: v8W3-X..._z99Q..."
+              placeholder="Paste Cloudflare API token..."
               value={apiToken}
               onChange={(e) => setApiToken(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 pl-24 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 pl-24 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
             />
-            <div className="absolute left-2 flex items-center gap-1">
+            <div className="absolute left-1.5 flex items-center gap-1">
               <button
                 type="button"
                 onClick={() => setShowToken(!showToken)}
                 className="p-1 rounded text-slate-400 hover:text-slate-200 transition"
-                title={showToken ? 'مخفی‌سازی' : 'نمایش'}
               >
                 {showToken ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
               </button>
               <button
                 type="button"
-                onClick={handleVerifyToken}
+                onClick={onVerifyToken}
                 disabled={isVerifying || !apiToken.trim()}
-                className="px-2.5 py-1 rounded text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-sky-400 disabled:opacity-50 transition"
+                className="px-2.5 py-1 rounded text-[11px] font-medium bg-slate-800 text-sky-400 hover:bg-slate-700 disabled:opacity-50 transition"
               >
-                {isVerifying ? '...' : 'تأیید توکن'}
+                {isVerifying ? '...' : 'Verify'}
               </button>
             </div>
           </div>
-          {verifyMessage && (
-            <p className={`text-[11px] mt-1 ${verifyMessage.type === 'success' ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {verifyMessage.text}
-            </p>
-          )}
+          {verifyError && <p className="text-[11px] text-rose-400 mt-1">{verifyError}</p>}
         </div>
 
-        {/* Account ID Input */}
+        {/* Account ID */}
         <div className="space-y-1.5">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+          <label className="text-xs font-semibold text-slate-300 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
               <User className="w-3.5 h-3.5 text-sky-400" />
-              <span>شناسه اکانت (Account ID)</span>
-            </label>
-            <span className="text-[11px] text-slate-500">انتخاب از اکانت‌های شناسایی شده</span>
-          </div>
+              <span>Account ID</span>
+            </span>
+            <span className="text-[11px] text-slate-500">Auto-filled from token</span>
+          </label>
           {accounts.length > 0 ? (
             <select
-              id="cf-account-select"
               value={accountId}
               onChange={(e) => setAccountId(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500 transition font-mono"
+              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
             >
               {accounts.map((acc) => (
                 <option key={acc.id} value={acc.id}>
@@ -206,32 +143,26 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
             </select>
           ) : (
             <input
-              id="cf-account-id"
               type="text"
-              placeholder="مثال: e4b2d1847c16f0a9bc490..."
+              placeholder="Cloudflare account ID..."
               value={accountId}
               onChange={(e) => setAccountId(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+              className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
             />
           )}
         </div>
 
         {/* Worker Script Name */}
         <div className="space-y-1.5">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-              <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-              <span>نام ورکر (Worker Name)</span>
-            </label>
-            <span className="text-[11px] text-slate-500">پیشوند استاندارد telo-</span>
-          </div>
+          <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+            <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Worker Name</span>
+          </label>
           <input
-            id="cf-worker-name"
             type="text"
-            placeholder="telo-proxy"
             value={workerName}
             onChange={(e) => setWorkerName(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+            className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
           />
         </div>
 
@@ -240,7 +171,7 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
           <div className="flex items-center justify-between">
             <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5 text-emerald-400" />
-              <span>کلید سکرت پروکسی (32 کاراکتر Hex)</span>
+              <span>Proxy Secret (32 Hex Characters)</span>
             </label>
             <button
               type="button"
@@ -248,91 +179,51 @@ export const CloudflareDeployer: React.FC<CloudflareDeployerProps> = ({
               className="text-[11px] text-sky-400 hover:text-sky-300 transition flex items-center gap-1"
             >
               <RefreshCw className="w-3 h-3" />
-              <span>تولید تصادفی</span>
+              <span>Generate Random</span>
             </button>
           </div>
           <input
-            id="cf-proxy-secret"
             type="text"
             value={proxySecret}
             onChange={(e) => setProxySecret(e.target.value)}
-            className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-500 transition font-mono"
+            className="w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-sky-500 font-mono"
           />
         </div>
       </div>
 
-      {/* Error alert if any */}
-      {deployResult?.error && (
-        <div className="mb-5 p-3.5 rounded-xl bg-rose-950/50 border border-rose-800/50 flex items-start gap-2.5 text-xs text-rose-300">
-          <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
-          <div>
-            <div className="font-semibold mb-0.5">خطا در بارگذاری یا فعال‌سازی:</div>
-            <div>{deployResult.error}</div>
-          </div>
+      {deployError && (
+        <div className="p-3.5 rounded-xl bg-rose-950/60 border border-rose-800/80 text-xs text-rose-300 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          <div>{deployError}</div>
         </div>
       )}
 
-      {/* Success Banner */}
-      {deployResult?.success && (
-        <div className="mb-5 p-4 rounded-xl bg-emerald-950/40 border border-emerald-600/40 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
-              <CheckCircle2 className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="text-xs font-bold text-emerald-300">
-                ورکر با موفقیت مستقر شد و روتینگ workers.dev فعال است!
-              </div>
-              <div className="text-xs text-slate-300 font-mono flex items-center gap-2 mt-0.5">
-                <span>دامنه مستقیم:</span>
-                <a 
-                  href={deployResult.workerUrl} 
-                  target="_blank" 
-                  rel="noreferrer"
-                  className="text-sky-400 hover:underline flex items-center gap-1"
-                >
-                  {deployResult.workerUrl}
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              </div>
-            </div>
-          </div>
-
-          <div className="text-xs text-slate-400">
-            لینک‌های پروکسی و تنظیمات اپراتورها در پایین آماده اتصال است 👇
-          </div>
-        </div>
-      )}
-
-      {/* Actions */}
-      <div className="flex flex-wrap items-center gap-3">
+      {/* Action Buttons */}
+      <div className="flex flex-wrap items-center gap-3 pt-2">
         <button
-          id="btn-deploy-cloudflare"
           onClick={() => onDeploy(false)}
           disabled={isDeploying || !apiToken.trim() || !accountId.trim()}
-          className="flex-1 min-w-[200px] flex items-center justify-center gap-2 px-5 py-3 rounded-xl font-semibold text-xs sm:text-sm bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white shadow-lg shadow-sky-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition"
+          className="flex-1 min-w-[220px] flex items-center justify-center gap-2 py-3 px-5 rounded-xl font-semibold text-xs sm:text-sm bg-sky-600 hover:bg-sky-500 text-white shadow-lg shadow-sky-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition"
         >
           {isDeploying ? (
             <>
               <RefreshCw className="w-4 h-4 animate-spin" />
-              <span>در حال ارسال پکیج ماژولار و تنظیم Durable Object...</span>
+              <span>Deploying Multipart Bundle (metadata + DO)...</span>
             </>
           ) : (
             <>
               <Sparkles className="w-4 h-4" />
-              <span>دیپلوی خودکار پکیج در کلودفلر (Multipart Deploy)</span>
+              <span>Deploy to Cloudflare Workers</span>
             </>
           )}
         </button>
 
         <button
-          id="btn-simulate-deploy"
           onClick={() => onDeploy(true)}
           disabled={isDeploying}
-          className="flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-medium text-xs sm:text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
+          className="py-3 px-4 rounded-xl font-medium text-xs sm:text-sm bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition"
         >
-          <Zap className="w-4 h-4 text-amber-400" />
-          <span>تست دمو (آزمایش سریع رابط و لینک‌ها)</span>
+          Test Simulation
         </button>
       </div>
     </div>

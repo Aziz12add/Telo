@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Key, Cloud, Send, CheckCircle2, AlertCircle, ExternalLink, ShieldAlert, Cpu } from 'lucide-react';
+import { X, Key, ExternalLink, ShieldAlert, CheckCircle2, Globe2 } from 'lucide-react';
 
 interface HelpGuideModalProps {
   isOpen: boolean;
@@ -16,14 +16,14 @@ export const HelpGuideModal: React.FC<HelpGuideModalProps> = ({ isOpen, onClose 
         <div className="flex items-center justify-between p-4 sm:p-5 border-b border-slate-800">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center">
-              <Key className="w-4 h-4" />
+              <Globe2 className="w-4 h-4" />
             </div>
             <div>
               <h3 className="text-sm sm:text-base font-bold text-white">
-                راهنمای راه‌اندازی پروکسی تلگرام Telo v2 در کلودفلر
+                Telegram Official WEB Proxy v1 Guide
               </h3>
               <p className="text-[11px] text-slate-400">
-                مراحل دریافت دسترسی، ساختار فنی اتصال و نکات مهم قوانین کلودفلر
+                Setup guide &bull; Connection instructions &bull; Cloudflare limits
               </p>
             </div>
           </div>
@@ -38,14 +38,14 @@ export const HelpGuideModal: React.FC<HelpGuideModalProps> = ({ isOpen, onClose 
 
         {/* Scrollable Content */}
         <div className="flex-1 overflow-auto p-5 space-y-6 text-xs sm:text-sm text-slate-300">
-          {/* Step 1 */}
+          {/* Step 1: Token */}
           <div className="space-y-2">
             <div className="flex items-center gap-2 font-bold text-sky-400 text-sm">
               <span className="w-5 h-5 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center text-xs">1</span>
-              <span>نحوه ساخت API Token در کلودفلر (۳۰ ثانیه):</span>
+              <span>Create Cloudflare API Token (30 seconds):</span>
             </div>
             <p className="text-slate-400 leading-relaxed pr-7">
-              ۱. وارد داشبورد کلودفلر بخش توکن‌ها شوید:{' '}
+              1. Open Cloudflare API Tokens page:{' '}
               <a 
                 href="https://dash.cloudflare.com/profile/api-tokens" 
                 target="_blank" 
@@ -56,34 +56,36 @@ export const HelpGuideModal: React.FC<HelpGuideModalProps> = ({ isOpen, onClose 
                 <ExternalLink className="w-3 h-3" />
               </a>
               <br />
-              ۲. دکمه <strong className="text-white">Create Token</strong> را بزنید.
+              2. Click <strong>Create Token</strong> &rarr; use the <strong>Edit Cloudflare Workers</strong> template.
               <br />
-              ۳. الگوی <strong className="text-white">Edit Cloudflare Workers</strong> را انتخاب کنید.
+              3. Required permissions:
               <br />
-              ۴. دسترسی‌های زیر باید فعال باشند:
+              &bull; <code className="text-emerald-400 bg-slate-950 px-1 rounded">Account &gt; Workers Scripts &gt; Edit</code>
               <br />
-              • <code className="text-emerald-400 bg-slate-950 px-1 rounded">Account: Workers Scripts (Edit)</code>
+              &bull; <code className="text-emerald-400 bg-slate-950 px-1 rounded">Account &gt; Workers Subdomain &gt; Edit</code>
               <br />
-              • <code className="text-emerald-400 bg-slate-950 px-1 rounded">Account: Workers Subdomain (Read/Edit)</code>
+              &bull; <code className="text-emerald-400 bg-slate-950 px-1 rounded">Account &gt; Account Settings &gt; Read</code>
               <br />
-              ۵. روی دکمه <strong className="text-white">Continue to summary</strong> و سپس <strong className="text-white">Create Token</strong> بزنید و توکن تولید شده را کپی کنید.
+              4. Complete wizard and copy the generated token into Telo.
             </p>
           </div>
 
-          {/* Step 2 */}
+          {/* Step 2: How to Connect in Telegram */}
           <div className="space-y-2">
-            <div className="flex items-center gap-2 font-bold text-indigo-400 text-sm">
-              <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-xs">2</span>
-              <span>معماری فنی پروکسی چگونه است؟</span>
+            <div className="flex items-center gap-2 font-bold text-emerald-400 text-sm">
+              <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-300 flex items-center justify-center text-xs">2</span>
+              <span>How to connect in Telegram:</span>
             </div>
             <p className="text-slate-400 leading-relaxed pr-7">
-              پروکسی Telo از پکیج ماژولار با پشتیبانی از <code>cloudflare:sockets</code> و Durable Objects بهره می‌برد:
+              In Telegram:
               <br />
-              • درخواست کلاینت ورکر را بیدار کرده و اتصال مستقیم TCP با دیتاسنتر اصلی تلگرام (DC2 در هلند/آمستردام: <code>149.154.167.51:443</code>) برقرار می‌کند.
+              &bull; Open <strong>Settings &rarr; Data and Storage &rarr; Proxy Settings &rarr; Add Proxy</strong>.
               <br />
-              • سکرت به صورت ۳۲ کاراکتر هگزادسیمال با هندشیک رمزنگاری‌شده AES-CTR کار می‌کند.
+              &bull; Choose <strong>WEB Proxy</strong> (do NOT choose SOCKS5 or classic MTProto).
               <br />
-              • برای اپراتورهای ایرانسل، همراه اول و آسیاتک می‌توانید هم از دامنه مستقیم ورکر و هم از آی‌پی‌های تمیز Anycast استفاده کنید.
+              &bull; Paste your worker <strong>Hostname</strong> (e.g. <code className="text-white">myproxy.sub.workers.dev</code> without <code className="text-slate-500">https://</code>) and <strong>Secret</strong> (32 hex characters).
+              <br />
+              &bull; Or simply click the generated <code className="text-sky-400">https://t.me/webproxy?server=...&secret=...</code> link!
             </p>
           </div>
 
@@ -91,12 +93,16 @@ export const HelpGuideModal: React.FC<HelpGuideModalProps> = ({ isOpen, onClose 
           <div className="p-3.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-1.5">
             <div className="font-semibold text-amber-300 flex items-center gap-1.5 text-xs">
               <ShieldAlert className="w-4 h-4 text-amber-400" />
-              <span>محدودیت‌ها و قوانین کلودفلر (Terms of Service):</span>
+              <span>Technical Notes &amp; Limits:</span>
             </div>
             <p className="text-slate-400 text-xs leading-relaxed">
-              • در پلن رایگان کلودفلر، محدودیت ۱۰۰،۰۰۰ ریکوئست در روز وجود دارد که برای ارسال پیام‌های متنی و چت‌های معمولی کاملاً کافیست اما برای دانلود فایل‌های بسیار حجیم چند گیگابایتی پیشنهاد نمی‌شود.
+              &bull; <strong>Official Protocol:</strong> This uses the Telegram official WEB Proxy v1 bridge protocol over HTTPS / WebSockets (port 443).
               <br />
-              • تماس صوتی و تصویری تلگرام بر بستر UDP کار می‌کند، در حالی که ورکرها پروتکل TCP را رله می‌کنند؛ لذا تماس‌های صوتی معمولاً از مسیر مستقیم P2P خود تلگرام عبور داده می‌شوند.
+              &bull; <strong>Cloudflare Free Tier:</strong> 100,000 requests/day allowance.
+              <br />
+              &bull; <strong>Voice/Video Calls:</strong> Telegram voice calls rely on peer-to-peer UDP and may not route through TCP web proxies.
+              <br />
+              &bull; <strong>Access Control:</strong> The 32-hex secret acts as HMAC access control; requests without the valid HMAC bridge capability token receive an innocuous decoy page.
             </p>
           </div>
         </div>
@@ -107,7 +113,7 @@ export const HelpGuideModal: React.FC<HelpGuideModalProps> = ({ isOpen, onClose 
             onClick={onClose}
             className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold transition"
           >
-            بستن راهنما
+            Close / بستن
           </button>
         </div>
       </div>
