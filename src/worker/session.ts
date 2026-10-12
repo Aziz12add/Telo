@@ -2,32 +2,36 @@
 // Cloudflare Durable Object ProxySessionDO for Telegram Official WEB Proxy v1
 // Connects directly to Telegram Data Centers using cloudflare:sockets
 
-import { connect } from 'cloudflare:sockets';
+async function dialTelegramSocket(options: { hostname: string; port: number }) {
+  try {
+    // @ts-ignore
+    const sockets = await import('cloudflare:sockets');
+    return sockets.connect(options);
+  } catch {
+    throw new Error('cloudflare:sockets is only available in Cloudflare Workers runtime');
+  }
+}
 import {
   FRAME_TYPES,
+  encodeFrame,
+  decodeFrames,
   MAX_DATA_CHUNK,
   INITIAL_STREAM_WINDOW,
   MAX_STREAMS_PER_SESSION,
-  encodeFrame,
-  decodeFrames,
-  verifySessionToken,
-  computeBridgeCapability,
   constantTimeCompare,
-  canonicalizeHostname,
   ProtocolError,
   type Frame,
-} from './protocol.js';
+} from './protocol.ts';
 
 export const TELEGRAM_DCS: Record<number, { ip: string; port: number }> = Object.freeze({
   1: { ip: '149.154.175.50', port: 443 },
   2: { ip: '149.154.167.51', port: 443 },
   3: { ip: '149.154.175.100', port: 443 },
   4: { ip: '149.154.167.91', port: 443 },
-  5: { ip: '91.108.56.165', port: 443 },
+  5: { ip: '91.108.56.130', port: 443 },
 });
 
 export const DEFAULT_DC = TELEGRAM_DCS[2];
-
 const IDLE_TIMEOUT_MS = 300000; // 5 minutes
 
 class StreamContext {
@@ -50,104 +54,58 @@ class StreamContext {
   }
 }
 
-export interface Env {
-  PROXY_SECRET: string;
-  SESSIONS: DurableObjectNamespace;
-}
-
 export class ProxySessionDO {
-  private ctx: DurableObjectState;
-  private env: Env;
-  private ws: WebSocket | null = null;
-  private rxBuffer = new Uint8Array(0);
-  private streams = new Map<number, StreamContext>();
-  private tombstones = new Set<number>();
+  state: DurableObjectState;
+  env: any;
+  ws: WebSocket | null = null;
+  streams = new Map<number, StreamContext>();
+  tombstones = new Set<number>();
+  rxBuffer = new Uint8Array(0);
+  idleTimer: any = null;
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    this.ctx = ctx;
+  constructor(state: DurableObjectState, env: any) {
+    this.state = state;
     this.env = env;
   }
 
   private touchIdleTimer(): void {
-    try {
-      if (this.ctx?.storage?.setAlarm) {
-        this.ctx.storage.setAlarm(Date.now() + IDLE_TIMEOUT_MS);
-      }
-    } catch {}
-  }
-
-  async alarm(): Promise<void> {
-    this.closeAllStreams(0x00);
-    if (this.ws) {
-      try {
-        this.ws.close(1000, 'Session idle hibernation');
-      } catch {}
-      this.ws = null;
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
     }
+    this.idleTimer = setTimeout(() => {
+      this.closeCarrierProtocolViolation('Session idle timeout', 1000);
+    }, IDLE_TIMEOUT_MS);
   }
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+    // Enforce internal routing authentication from Worker edge
+    const internalAuth = request.headers.get('X-Internal-Auth');
+    if (!internalAuth || !constantTimeCompare(internalAuth, 'trusted-worker')) {
+      return new Response('Unauthorized internal call', { status: 403 });
+    }
 
-    if (request.headers.get('Upgrade') !== 'websocket') {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket upgrade', { status: 426 });
     }
 
-    const internalAuth = request.headers.get('X-Internal-Auth');
-    if (internalAuth !== 'trusted-worker') {
-      let isAuthorized = false;
-      const subprotocol = request.headers.get('Sec-WebSocket-Protocol');
-      const token = url.searchParams.get('token');
-
-      // Check subprotocol tproxy-v1.<token>
-      if (subprotocol) {
-        const match = subprotocol.match(/tproxy-v1\.([A-Za-z0-9_-]+)/);
-        if (match) {
-          const providedToken = match[1];
-          try {
-            const canonicalHost = canonicalizeHostname(url.hostname);
-            const expectedBridge = await computeBridgeCapability(this.env.PROXY_SECRET, canonicalHost);
-            if (constantTimeCompare(providedToken, expectedBridge)) {
-              isAuthorized = true;
-            }
-          } catch {}
-
-          if (!isAuthorized) {
-            const auth = await verifySessionToken(this.env.PROXY_SECRET, providedToken, 3600);
-            if (auth.valid) {
-              isAuthorized = true;
-            }
-          }
-        }
-      }
-
-      if (!isAuthorized && token) {
-        const auth = await verifySessionToken(this.env.PROXY_SECRET, token, 3600);
-        if (auth.valid) {
-          isAuthorized = true;
-        }
-      }
-
-      if (!isAuthorized) {
-        return new Response('Unauthorized: invalid or missing proxy token', { status: 403 });
-      }
-    }
-
-    // @ts-ignore Cloudflare WebSocketPair
+    // @ts-ignore WebSocketPair is a Cloudflare Workers global
     const pair = new WebSocketPair();
-    const [clientSocket, serverSocket] = Object.values(pair) as [WebSocket, WebSocket];
+    const clientSocket = pair[0];
+    const serverSocket = pair[1];
 
-    // @ts-ignore Cloudflare accept method
     serverSocket.accept();
     this.ws = serverSocket;
     this.touchIdleTimer();
-
     this.bindCarrierSocket(serverSocket);
 
     const headers = new Headers();
     const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
-    if (requestedProtocol?.includes('tproxy-v1')) {
-      headers.set('Sec-WebSocket-Protocol', 'tproxy-v1');
+    if (requestedProtocol) {
+      const parts = requestedProtocol.split(',').map((p) => p.trim());
+      const matched = parts.find((p) => p.startsWith('tproxy-v1'));
+      if (matched) {
+        headers.set('Sec-WebSocket-Protocol', matched);
+      }
     }
 
     return new Response(null, {
@@ -217,9 +175,26 @@ export class ProxySessionDO {
       }
 
       case FRAME_TYPES.OPEN: {
+        // Stream ID 0 is reserved for connection control
+        if (streamId === 0) {
+          this.sendStreamClose(0, 0x01);
+          return;
+        }
+
         let targetDcId = 2;
-        if (payload.byteLength >= 1) {
+        let explicitTarget: { ip: string; port: number } | null = null;
+
+        if (payload.byteLength === 1) {
           targetDcId = payload[0];
+        } else if (payload.byteLength === 2) {
+          const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+          targetDcId = Math.abs(view.getInt16(0, false));
+        } else if (payload.byteLength >= 6) {
+          // Explicit IPv4 + port: 4 bytes IP, 2 bytes port BE
+          const ip = `${payload[0]}.${payload[1]}.${payload[2]}.${payload[3]}`;
+          const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+          const port = view.getUint16(4, false);
+          explicitTarget = { ip, port: port || 443 };
         }
 
         if (this.tombstones.has(streamId) || this.streams.has(streamId)) {
@@ -231,7 +206,7 @@ export class ProxySessionDO {
           return;
         }
 
-        await this.openDcStream(streamId, targetDcId);
+        await this.openDcStream(streamId, targetDcId, explicitTarget);
         break;
       }
 
@@ -240,7 +215,6 @@ export class ProxySessionDO {
         if (!stream || stream.closed) {
           return;
         }
-
         await this.forwardDataUpstream(stream, payload);
         break;
       }
@@ -282,12 +256,16 @@ export class ProxySessionDO {
     }
   }
 
-  private async openDcStream(streamId: number, dcId: number): Promise<void> {
+  private async openDcStream(
+    streamId: number,
+    dcId: number,
+    explicitTarget: { ip: string; port: number } | null = null
+  ): Promise<void> {
     const abortController = new AbortController();
     const stream = new StreamContext(streamId, dcId, abortController);
     this.streams.set(streamId, stream);
 
-    const targetDc = TELEGRAM_DCS[dcId] || DEFAULT_DC;
+    const targetDc = explicitTarget || TELEGRAM_DCS[dcId] || DEFAULT_DC;
 
     try {
       const dialTimeout = setTimeout(() => {
@@ -295,12 +273,13 @@ export class ProxySessionDO {
       }, 10000);
 
       // Connect transparently to Telegram Data Center on port 443
-      const socket = connect({
+      const socket = await dialTelegramSocket({
         hostname: targetDc.ip,
         port: targetDc.port,
       });
 
       clearTimeout(dialTimeout);
+
       if (stream.closed || abortController.signal.aborted) {
         try {
           socket.close();
@@ -320,10 +299,8 @@ export class ProxySessionDO {
 
   private async forwardDataUpstream(stream: StreamContext, data: Uint8Array): Promise<void> {
     if (stream.closed || !stream.writer || data.byteLength === 0) return;
-
     try {
       await stream.writer.write(data);
-
       stream.inboundWindow -= data.byteLength;
       if (stream.inboundWindow <= INITIAL_STREAM_WINDOW / 2) {
         const credit = INITIAL_STREAM_WINDOW - stream.inboundWindow;
@@ -340,13 +317,11 @@ export class ProxySessionDO {
       while (!stream.closed && stream.reader) {
         const { value, done } = await stream.reader.read();
         if (done) break;
-
         if (value && value.byteLength > 0) {
           let offset = 0;
           while (offset < value.byteLength && !stream.closed) {
             const chunkSize = Math.min(MAX_DATA_CHUNK, value.byteLength - offset);
             const chunk = value.subarray(offset, offset + chunkSize);
-
             this.sendFrame(FRAME_TYPES.DATA, stream.streamId, chunk);
             offset += chunkSize;
             stream.outboundWindow -= chunkSize;
@@ -397,7 +372,6 @@ export class ProxySessionDO {
   private closeStream(streamId: number, code = 0): void {
     const stream = this.streams.get(streamId);
     if (!stream) return;
-
     stream.closed = true;
     stream.abortController.abort();
     this.streams.delete(streamId);

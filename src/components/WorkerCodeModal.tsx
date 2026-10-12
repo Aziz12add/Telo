@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
-import { X, Copy, Check, Code, ExternalLink, Terminal, Layers } from 'lucide-react';
-import { generateWebProxyBundle } from '../worker-runtime/bundle';
+import React, { useState, useEffect } from "react";
+import { X, Copy, Check, Terminal, Layers, Loader2 } from "lucide-react";
 
 interface WorkerCodeModalProps {
   isOpen: boolean;
@@ -16,24 +15,54 @@ export const WorkerCodeModal: React.FC<WorkerCodeModalProps> = ({
   proxySecret,
 }) => {
   const [copied, setCopied] = useState(false);
-  const [activeFile, setActiveFile] = useState<string>('index.js');
+  const [activeFile, setActiveFile] = useState<string>("index.js");
+  const [loading, setLoading] = useState(false);
+  const [bundleFiles, setBundleFiles] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    let isMounted = true;
+    setLoading(true);
+    setError(null);
+
+    const name = encodeURIComponent(workerName || "telo-webproxy");
+    const secret = encodeURIComponent(proxySecret || "000102030405060708090a0b0c0d0e0f");
+
+    fetch(`/api/worker/bundle?workerName=${name}&proxySecret=${secret}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (!isMounted) return;
+        if (data.success && data.files) {
+          setBundleFiles(data.files);
+        } else {
+          throw new Error(data.error || "Failed to fetch bundle files");
+        }
+      })
+      .catch((err) => {
+        if (!isMounted) return;
+        setError(err.message || "Error loading worker bundle preview");
+      })
+      .finally(() => {
+        if (isMounted) setLoading(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [isOpen, workerName, proxySecret]);
 
   if (!isOpen) return null;
 
-  let fileContent = '';
-  try {
-    const bundle = generateWebProxyBundle({
-      workerName: workerName || 'telo-webproxy',
-      proxySecret: proxySecret || '000102030405060708090a0b0c0d0e0f',
-    });
-
-    fileContent =
-      activeFile === 'metadata.json'
-        ? JSON.stringify(bundle.metadata, null, 2)
-        : bundle.files[activeFile] || '';
-  } catch {
-    fileContent = '// Source bundle available in root repository (index.js, session.js, protocol.js)';
-  }
+  const fileContent = bundleFiles[activeFile] || (
+    error
+      ? `// ${error}\n// Source bundle available in repository (index.js, session.js, protocol.js)`
+      : "// Loading bundle modules..."
+  );
 
   const handleCopy = () => {
     navigator.clipboard.writeText(fileContent);
@@ -59,16 +88,15 @@ export const WorkerCodeModal: React.FC<WorkerCodeModalProps> = ({
               </p>
             </div>
           </div>
-
           <div className="flex items-center gap-2">
             <button
               onClick={handleCopy}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-sky-600 hover:bg-sky-500 text-white transition"
+              disabled={loading}
+              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white transition"
             >
               {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copied ? 'Copied' : `Copy ${activeFile}`}</span>
+              <span>{copied ? "Copied" : `Copy ${activeFile}`}</span>
             </button>
-
             <button
               onClick={onClose}
               className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition"
@@ -80,19 +108,25 @@ export const WorkerCodeModal: React.FC<WorkerCodeModalProps> = ({
 
         {/* File Tabs */}
         <div className="bg-slate-950 px-4 py-2 border-b border-slate-800/80 flex items-center gap-2 overflow-x-auto">
-          {['index.js', 'session.js', 'protocol.js', 'metadata.json'].map((f) => (
+          {["index.js", "session.js", "protocol.js", "metadata.json"].map((f) => (
             <button
               key={f}
               onClick={() => setActiveFile(f)}
               className={`px-3 py-1 rounded-md text-xs font-mono transition ${
                 activeFile === f
-                  ? 'bg-slate-800 text-sky-400 font-semibold border border-slate-700'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? "bg-slate-800 text-sky-400 font-semibold border border-slate-700"
+                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
               }`}
             >
               {f}
             </button>
           ))}
+          {loading && (
+            <div className="ml-auto flex items-center gap-1.5 text-xs text-slate-400 font-mono">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+              <span>Generating bundle...</span>
+            </div>
+          )}
         </div>
 
         {/* Code Content */}

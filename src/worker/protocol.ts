@@ -53,6 +53,7 @@ export function constantTimeCompare(
 
   const ua = a instanceof Uint8Array ? a : new TextEncoder().encode(String(a));
   const ub = b instanceof Uint8Array ? b : new TextEncoder().encode(String(b));
+
   if (ua.length !== ub.length) return false;
   let diff = 0;
   for (let i = 0; i < ua.length; i++) {
@@ -62,19 +63,29 @@ export function constantTimeCompare(
 }
 
 /**
- * Parses a 32-hex character secret (or 34-hex starting with 'dd') into 16 bytes.
+ * Parses a 32-hex character secret (or prefixed with 'dd' or 'ee') into 16 bytes.
  */
-export function parseSecret(secretHex: string): Uint8Array {
-  if (typeof secretHex !== 'string') {
-    throw new TypeError('Secret must be a string');
+export function parseSecret(secret: string | Uint8Array): Uint8Array {
+  if (secret instanceof Uint8Array) {
+    if (secret.length === 16) return secret;
+    throw new Error('Secret byte array must be exactly 16 bytes');
   }
-  let s = secretHex.trim().toLowerCase();
+  if (typeof secret !== 'string') {
+    throw new TypeError('Secret must be a string or Uint8Array');
+  }
+
+  let s = secret.trim().toLowerCase();
   if (s.startsWith('dd')) {
     s = s.slice(2);
+  } else if (s.startsWith('ee')) {
+    // Fake TLS secret: starts with ee, followed by 32 hex chars of key, then domain
+    s = s.slice(2, 34);
   }
+
   if (s.length !== 32 || !/^[0-9a-f]{32}$/.test(s)) {
-    throw new Error('Secret must be 32 hex chars (or dd + 32 hex chars)');
+    throw new Error('Secret must be 32 hex characters (or prefixed with dd/ee)');
   }
+
   const out = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
     out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
@@ -101,28 +112,30 @@ export function toBase64UrlNoPad(buffer: Uint8Array | ArrayBuffer): string {
  * Validates and canonicalizes the request hostname.
  */
 export function canonicalizeHostname(rawHost: string): string {
-  if (!rawHost || typeof rawHost !== 'string') {
-    throw new Error('Invalid host');
+  if (!rawHost || typeof rawHost !== "string") {
+    throw new Error("Invalid host");
   }
 
-  const clean = rawHost.split(':')[0].trim().toLowerCase();
-  if (!clean || clean.length < 3 || !clean.includes('.')) {
-    throw new Error('Host must contain dot and be at least 3 characters');
+  const raw = rawHost.trim().toLowerCase();
+  if (raw.startsWith("[") || ((raw.match(/:/g) || []).length > 1)) {
+    throw new Error("IPv6 addresses are not permitted");
   }
 
-  // Reject raw IPv4 and IPv6
+  const clean = raw.split(":")[0].trim().replace(/\.+$/, "");
+  if (!clean || clean.length < 3 || !clean.includes(".")) {
+    throw new Error("Host must contain dot and be at least 3 characters");
+  }
+
+  // Reject raw IPv4
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(clean)) {
-    throw new Error('Direct IP addresses are not permitted');
-  }
-  if (clean.startsWith('[') || clean.includes(':')) {
-    throw new Error('IPv6 addresses are not permitted');
+    throw new Error("Direct IP addresses are not permitted");
   }
 
   try {
-    const url = new URL(`https://${clean}`);
+    const url = new URL("https://" + clean);
     return url.hostname;
   } catch {
-    throw new Error('Invalid URL hostname');
+    throw new Error("Invalid URL hostname");
   }
 }
 
@@ -136,7 +149,7 @@ export async function computeBridgeCapability(
   hostname: string
 ): Promise<string> {
   const canonicalHost = canonicalizeHostname(hostname);
-  const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
+  const secretBytes = parseSecret(secret);
   const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${canonicalHost}`);
 
   const key = await crypto.subtle.importKey(
@@ -160,6 +173,7 @@ export async function verifyBridgeCapability(
   hostname: string
 ): Promise<boolean> {
   try {
+    if (!providedBridge || typeof providedBridge !== 'string') return false;
     const expected = await computeBridgeCapability(secret, hostname);
     return constantTimeCompare(providedBridge.trim(), expected);
   } catch {
@@ -175,7 +189,7 @@ export async function signSessionToken(
   sessionId: string,
   timestamp: number
 ): Promise<string> {
-  const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
+  const secretBytes = parseSecret(secret);
   const data = new TextEncoder().encode(`session-v1\n${sessionId}\n${timestamp}`);
 
   const key = await crypto.subtle.importKey(
@@ -202,10 +216,12 @@ export async function verifySessionToken(
   if (typeof token !== 'string') {
     return { valid: false };
   }
+
   const parts = token.split('.');
   if (parts.length !== 3) {
     return { valid: false };
   }
+
   const [sessionId, tsStr, signature] = parts;
   const timestamp = parseInt(tsStr, 10);
   if (!Number.isFinite(timestamp)) {
@@ -220,11 +236,9 @@ export async function verifySessionToken(
   try {
     const expectedToken = await signSessionToken(secret, sessionId, timestamp);
     const expectedSig = expectedToken.split('.')[2];
-
     if (!constantTimeCompare(signature, expectedSig)) {
       return { valid: false };
     }
-
     return { valid: true, sessionId, timestamp };
   } catch {
     return { valid: false };
@@ -290,7 +304,7 @@ export function decodeFrame(buffer: Uint8Array): {
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const type = view.getUint8(0);
-  const streamId = (view.getUint8(1) << 16) | (view.getUint8(2) << 8) | view.getUint8(3);
+  const streamId = (((view.getUint8(1) << 16) | (view.getUint8(2) << 8) | view.getUint8(3)) >>> 0);
   const payloadLen = view.getUint32(4, false);
 
   if (payloadLen > CARRIER_HARD_MAX) {
@@ -305,8 +319,8 @@ export function decodeFrame(buffer: Uint8Array): {
     throw new ProtocolError(`DATA frame payload ${payloadLen} exceeds 64KiB`, 1002);
   }
 
-  const payload = buffer.slice(8, 8 + payloadLen);
-  const remainder = buffer.slice(8 + payloadLen);
+  const payload = buffer.subarray(8, 8 + payloadLen);
+  const remainder = buffer.subarray(8 + payloadLen);
 
   return {
     frame: { type, streamId, payload },

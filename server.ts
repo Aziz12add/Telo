@@ -1,3 +1,4 @@
+import fs from 'fs';
 import express, { Request, Response } from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
@@ -177,6 +178,48 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: `Deployment error: ${err.message || 'Unknown network error'}`,
+    });
+  }
+});
+
+
+// Endpoint to inspect generated Worker bundle and modules
+app.get("/api/worker/bundle", (req: Request, res: Response) => {
+  const workerName = String(req.query.workerName || "telo-webproxy");
+  const proxySecret = String(req.query.proxySecret || "000102030405060708090a0b0c0d0e0f");
+
+  try {
+    const bundle = generateWebProxyBundle({
+      workerName: workerName.trim(),
+      proxySecret: proxySecret.trim(),
+    });
+
+    const root = process.cwd();
+    const readSafe = (filePath: string) => {
+      try {
+        return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : "";
+      } catch {
+        return "";
+      }
+    };
+
+    const sessionCode = readSafe(path.join(root, "session.js")) || readSafe(path.join(root, "src", "worker", "session.ts"));
+    const protocolCode = readSafe(path.join(root, "protocol.js")) || readSafe(path.join(root, "src", "worker", "protocol.ts"));
+
+    return res.json({
+      success: true,
+      metadata: bundle.metadata,
+      files: {
+        "index.js": bundle.files["index.js"] || "",
+        "session.js": sessionCode,
+        "protocol.js": protocolCode,
+        "metadata.json": JSON.stringify(bundle.metadata, null, 2),
+      },
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Failed to generate bundle preview",
     });
   }
 });

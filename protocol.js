@@ -1,44 +1,34 @@
-// protocol.js
-// Official Telegram WEB Proxy v1 Protocol Codec & Cryptographic Capabilities
-
-export const FRAME_TYPES = Object.freeze({
-  OPEN: 0x01,
-  DATA: 0x02,
-  CLOSE: 0x03,
-  WINDOW: 0x04,
-  PING: 0x05,
-  PONG: 0x06,
-  HELLO: 0x10,
-  WELCOME: 0x11,
-  BYE: 0x1f,
+const FRAME_TYPES = Object.freeze({
+  OPEN: 1,
+  DATA: 2,
+  CLOSE: 3,
+  WINDOW: 4,
+  PING: 5,
+  PONG: 6,
+  HELLO: 16,
+  WELCOME: 17,
+  BYE: 31
 });
-
-export const MAX_DATA_CHUNK = 64 * 1024; // 64 KiB
-export const CARRIER_HARD_MAX = 2 * 1024 * 1024; // 2 MiB
-export const INITIAL_STREAM_WINDOW = 4 * 1024 * 1024; // 4 MiB
-export const MAX_STREAMS_PER_SESSION = 32;
-
-export class ProtocolError extends Error {
+const MAX_DATA_CHUNK = 64 * 1024;
+const CARRIER_HARD_MAX = 2 * 1024 * 1024;
+const INITIAL_STREAM_WINDOW = 4 * 1024 * 1024;
+const MAX_STREAMS_PER_SESSION = 32;
+class ProtocolError extends Error {
   constructor(message, code = 1002) {
     super(message);
-    this.name = 'ProtocolError';
+    this.name = "ProtocolError";
     this.code = code;
   }
 }
-
-/**
- * Constant-time comparison to prevent timing attacks.
- */
-export function constantTimeCompare(a, b) {
-  if (typeof a === 'string' && typeof b === 'string') {
+function constantTimeCompare(a, b) {
+  if (typeof a === "string" && typeof b === "string") {
     if (a.length !== b.length) return false;
-    let diff = 0;
+    let diff2 = 0;
     for (let i = 0; i < a.length; i++) {
-      diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+      diff2 |= a.charCodeAt(i) ^ b.charCodeAt(i);
     }
-    return diff === 0;
+    return diff2 === 0;
   }
-
   const ua = a instanceof Uint8Array ? a : new TextEncoder().encode(String(a));
   const ub = b instanceof Uint8Array ? b : new TextEncoder().encode(String(b));
   if (ua.length !== ub.length) return false;
@@ -48,20 +38,22 @@ export function constantTimeCompare(a, b) {
   }
   return diff === 0;
 }
-
-/**
- * Parses a 32-hex character secret (or 34-hex starting with 'dd') into 16 bytes.
- */
-export function parseSecret(secretHex) {
-  if (typeof secretHex !== 'string') {
-    throw new TypeError('Secret must be a string');
+function parseSecret(secret) {
+  if (secret instanceof Uint8Array) {
+    if (secret.length === 16) return secret;
+    throw new Error("Secret byte array must be exactly 16 bytes");
   }
-  let s = secretHex.trim().toLowerCase();
-  if (s.startsWith('dd')) {
+  if (typeof secret !== "string") {
+    throw new TypeError("Secret must be a string or Uint8Array");
+  }
+  let s = secret.trim().toLowerCase();
+  if (s.startsWith("dd")) {
     s = s.slice(2);
+  } else if (s.startsWith("ee")) {
+    s = s.slice(2, 34);
   }
   if (s.length !== 32 || !/^[0-9a-f]{32}$/.test(s)) {
-    throw new Error('Secret must be 32 hex chars (or dd + 32 hex chars)');
+    throw new Error("Secret must be 32 hex characters (or prefixed with dd/ee)");
   }
   const out = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
@@ -69,113 +61,81 @@ export function parseSecret(secretHex) {
   }
   return out;
 }
-
-/**
- * Encodes Uint8Array or ArrayBuffer into unpadded base64url.
- */
-export function toBase64UrlNoPad(buffer) {
+function toBase64UrlNoPad(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-  let binary = '';
+  let binary = "";
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary)
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-
-/**
- * Validates and canonicalizes the request hostname.
- */
-export function canonicalizeHostname(rawHost) {
-  if (!rawHost || typeof rawHost !== 'string') {
-    throw new Error('Invalid host');
+function canonicalizeHostname(rawHost) {
+  if (!rawHost || typeof rawHost !== "string") {
+    throw new Error("Invalid host");
   }
-
-  const clean = rawHost.split(':')[0].trim().toLowerCase();
-  if (!clean || clean.length < 3 || !clean.includes('.')) {
-    throw new Error('Host must contain dot and be at least 3 characters');
+  const raw = rawHost.trim().toLowerCase();
+  if (raw.startsWith("[") || (raw.match(/:/g) || []).length > 1) {
+    throw new Error("IPv6 addresses are not permitted");
   }
-
-  // Reject raw IPv4 and IPv6
+  const clean = raw.split(":")[0].trim().replace(/\.+$/, "");
+  if (!clean || clean.length < 3 || !clean.includes(".")) {
+    throw new Error("Host must contain dot and be at least 3 characters");
+  }
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(clean)) {
-    throw new Error('Direct IP addresses are not permitted');
+    throw new Error("Direct IP addresses are not permitted");
   }
-  if (clean.startsWith('[') || clean.includes(':')) {
-    throw new Error('IPv6 addresses are not permitted');
-  }
-
   try {
-    const url = new URL(`https://${clean}`);
+    const url = new URL("https://" + clean);
     return url.hostname;
   } catch {
-    throw new Error('Invalid URL hostname');
+    throw new Error("Invalid URL hostname");
   }
 }
-
-/**
- * Computes official Telegram Web Proxy bridge capability hash:
- * context = UTF-8("tdesktop-web-proxy-bridge-v1\n" + hostname)
- * bridge  = base64url-nopad(HMAC-SHA256(key=secretBytes, message=context))
- */
-export async function computeBridgeCapability(secret, hostname) {
+async function computeBridgeCapability(secret, hostname) {
   const canonicalHost = canonicalizeHostname(hostname);
-  const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
-  const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${canonicalHost}`);
-
+  const secretBytes = parseSecret(secret);
+  const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1
+${canonicalHost}`);
   const key = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     secretBytes,
-    { name: 'HMAC', hash: 'SHA-256' },
+    { name: "HMAC", hash: "SHA-256" },
     false,
-    ['sign']
+    ["sign"]
   );
-
-  const signature = await crypto.subtle.sign('HMAC', key, context);
+  const signature = await crypto.subtle.sign("HMAC", key, context);
   return toBase64UrlNoPad(signature);
 }
-
-/**
- * Verifies if the provided bridge capability string matches the expected host and secret.
- */
-export async function verifyBridgeCapability(providedBridge, secret, hostname) {
+async function verifyBridgeCapability(providedBridge, secret, hostname) {
   try {
+    if (!providedBridge || typeof providedBridge !== "string") return false;
     const expected = await computeBridgeCapability(secret, hostname);
     return constantTimeCompare(providedBridge.trim(), expected);
   } catch {
     return false;
   }
 }
-
-/**
- * Signs a session token for WebSocket authentication.
- */
-export async function signSessionToken(secret, sessionId, timestamp) {
-  const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
-  const data = new TextEncoder().encode(`session-v1\n${sessionId}\n${timestamp}`);
-
+async function signSessionToken(secret, sessionId, timestamp) {
+  const secretBytes = parseSecret(secret);
+  const data = new TextEncoder().encode(`session-v1
+${sessionId}
+${timestamp}`);
   const key = await crypto.subtle.importKey(
-    'raw',
+    "raw",
     secretBytes,
-    { name: 'HMAC', hash: 'SHA-256' },
+    { name: "HMAC", hash: "SHA-256" },
     false,
-    ['sign']
+    ["sign"]
   );
-
-  const sig = await crypto.subtle.sign('HMAC', key, data);
+  const sig = await crypto.subtle.sign("HMAC", key, data);
   const sigB64 = toBase64UrlNoPad(sig);
   return `${sessionId}.${timestamp}.${sigB64}`;
 }
-
-/**
- * Verifies signed session token.
- */
-export async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
-  if (typeof token !== 'string') {
+async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
+  if (typeof token !== "string") {
     return { valid: false };
   }
-  const parts = token.split('.');
+  const parts = token.split(".");
   if (parts.length !== 3) {
     return { valid: false };
   }
@@ -184,109 +144,72 @@ export async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
   if (!Number.isFinite(timestamp)) {
     return { valid: false };
   }
-
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(Date.now() / 1e3);
   if (Math.abs(now - timestamp) > maxAgeSeconds) {
     return { valid: false };
   }
-
   try {
     const expectedToken = await signSessionToken(secret, sessionId, timestamp);
-    const expectedSig = expectedToken.split('.')[2];
-
+    const expectedSig = expectedToken.split(".")[2];
     if (!constantTimeCompare(signature, expectedSig)) {
       return { valid: false };
     }
-
     return { valid: true, sessionId, timestamp };
   } catch {
     return { valid: false };
   }
 }
-
-/**
- * Official Telegram WEB Proxy v1 Frame Encoder:
- * Header (8 bytes):
- * [type: u8 (1B)][stream_id: u24 BE (3B)][payload_length: u32 BE (4B)][payload]
- */
-export function encodeFrame(type, streamId = 0, payload = new Uint8Array(0)) {
+function encodeFrame(type, streamId = 0, payload = new Uint8Array(0)) {
   const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
   const payloadLen = payloadBytes.byteLength;
-
   if (type === FRAME_TYPES.DATA && payloadLen > MAX_DATA_CHUNK) {
     throw new ProtocolError(`DATA frame payload ${payloadLen} exceeds 64KiB`, 1002);
   }
-
   if (payloadLen > CARRIER_HARD_MAX) {
     throw new ProtocolError(`Frame payload ${payloadLen} exceeds carrier limit 2MiB`, 1002);
   }
-
   const buffer = new Uint8Array(8 + payloadLen);
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
-  // Byte 0: type (u8)
-  view.setUint8(0, type & 0xff);
-
-  // Bytes 1..3: stream_id (u24 big-endian)
-  view.setUint8(1, (streamId >>> 16) & 0xff);
-  view.setUint8(2, (streamId >>> 8) & 0xff);
-  view.setUint8(3, streamId & 0xff);
-
-  // Bytes 4..7: payload_length (u32 big-endian)
+  view.setUint8(0, type & 255);
+  view.setUint8(1, streamId >>> 16 & 255);
+  view.setUint8(2, streamId >>> 8 & 255);
+  view.setUint8(3, streamId & 255);
   view.setUint32(4, payloadLen, false);
-
   if (payloadLen > 0) {
     buffer.set(payloadBytes, 8);
   }
-
   return buffer;
 }
-
-/**
- * Decodes a single frame from the buffer according to the official Telegram WEB Proxy v1 spec.
- */
-export function decodeFrame(buffer) {
+function decodeFrame(buffer) {
   if (!(buffer instanceof Uint8Array)) {
-    throw new TypeError('Buffer must be an instance of Uint8Array');
+    throw new TypeError("Buffer must be an instance of Uint8Array");
   }
-
   if (buffer.byteLength < 8) {
     return { frame: null, remainder: buffer };
   }
-
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const type = view.getUint8(0);
-  const streamId = (view.getUint8(1) << 16) | (view.getUint8(2) << 8) | view.getUint8(3);
+  const streamId = (view.getUint8(1) << 16 | view.getUint8(2) << 8 | view.getUint8(3)) >>> 0;
   const payloadLen = view.getUint32(4, false);
-
   if (payloadLen > CARRIER_HARD_MAX) {
     throw new ProtocolError(`Payload length ${payloadLen} exceeds carrier limit 2MiB`, 1002);
   }
-
   if (buffer.byteLength < 8 + payloadLen) {
     return { frame: null, remainder: buffer };
   }
-
   if (type === FRAME_TYPES.DATA && payloadLen > MAX_DATA_CHUNK) {
     throw new ProtocolError(`DATA frame payload ${payloadLen} exceeds 64KiB`, 1002);
   }
-
-  const payload = buffer.slice(8, 8 + payloadLen);
-  const remainder = buffer.slice(8 + payloadLen);
-
+  const payload = buffer.subarray(8, 8 + payloadLen);
+  const remainder = buffer.subarray(8 + payloadLen);
   return {
     frame: { type, streamId, payload },
-    remainder,
+    remainder
   };
 }
-
-/**
- * Decodes all complete frames available in the buffer.
- */
-export function decodeFrames(buffer) {
+function decodeFrames(buffer) {
   const frames = [];
   let current = buffer;
-
   while (current.byteLength >= 8) {
     const { frame, remainder } = decodeFrame(current);
     if (!frame) {
@@ -295,6 +218,24 @@ export function decodeFrames(buffer) {
     frames.push(frame);
     current = remainder;
   }
-
   return { frames, remainder: current };
 }
+export {
+  CARRIER_HARD_MAX,
+  FRAME_TYPES,
+  INITIAL_STREAM_WINDOW,
+  MAX_DATA_CHUNK,
+  MAX_STREAMS_PER_SESSION,
+  ProtocolError,
+  canonicalizeHostname,
+  computeBridgeCapability,
+  constantTimeCompare,
+  decodeFrame,
+  decodeFrames,
+  encodeFrame,
+  parseSecret,
+  signSessionToken,
+  toBase64UrlNoPad,
+  verifyBridgeCapability,
+  verifySessionToken
+};

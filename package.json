@@ -9,7 +9,9 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "build:worker": "esbuild src/worker/protocol.ts --format=esm --target=es2022 --outfile=protocol.js && esbuild src/worker/session.ts --format=esm --target=es2022 --outfile=session.js && esbuild src/worker/index.ts --bundle --format=esm --target=es2022 --external:cloudflare:sockets --outfile=index.js",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

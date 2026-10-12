@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import * as esbuild from 'esbuild';
 
 export interface WorkerBundleConfig {
   workerName: string;
@@ -34,13 +35,32 @@ export function generateWebProxyBundle(config: WorkerBundleConfig): WorkerBundle
   }
 
   const root = process.cwd();
+  const workerEntry = path.join(root, 'src', 'worker', 'index.ts');
+
+  let bundledCode = '';
+  try {
+    const result = esbuild.buildSync({
+      entryPoints: [workerEntry],
+      bundle: true,
+      format: 'esm',
+      target: 'es2022',
+      external: ['cloudflare:sockets'],
+      write: false,
+    });
+    bundledCode = result.outputFiles[0].text;
+  } catch (err) {
+    const rootIndex = path.join(root, 'index.js');
+    if (fs.existsSync(rootIndex)) {
+      bundledCode = fs.readFileSync(rootIndex, 'utf-8');
+    } else {
+      throw new Error(`Failed to bundle worker from ${workerEntry}: ${err}`);
+    }
+  }
+
   return {
     metadata,
     files: {
-      'index.js': fs.readFileSync(path.join(root, 'index.js'), 'utf-8'),
-      'session.js': fs.readFileSync(path.join(root, 'session.js'), 'utf-8'),
-      'protocol.js': fs.readFileSync(path.join(root, 'protocol.js'), 'utf-8'),
-      'mtproxy.js': fs.readFileSync(path.join(root, 'mtproxy.js'), 'utf-8'),
+      'index.js': bundledCode,
     },
   };
 }
