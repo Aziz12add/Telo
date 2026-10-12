@@ -36,7 +36,6 @@ class StreamSession {
 
   async start() {
     try {
-      // Cloudflare sockets API: object form, not "ip:port" string
       this.socket = connect({ hostname: this.ip, port: this.port });
       await this.socket.opened;
       this.writer = this.socket.writable.getWriter();
@@ -75,7 +74,7 @@ class StreamSession {
         }
       }
     } catch {
-      // ignore
+      /* ignore */
     } finally {
       this.close(0x00);
     }
@@ -92,7 +91,9 @@ class StreamSession {
       this.writer?.close();
       this.reader?.cancel();
       this.socket?.close();
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     this.parent.notifyClosed(this.streamId, code);
   }
 }
@@ -164,7 +165,7 @@ export class ProxySessionDO {
         break;
       }
       case FRAME_TYPES.OPEN: {
-        const streamId = frame.streamId || (frame.payload[0] ?? 1);
+        const streamId = frame.streamId || 1;
         if (this.streams.has(streamId) || this.streams.size >= MAX_STREAMS) {
           this.notifyClosed(streamId, 0x03);
           return;
@@ -185,7 +186,11 @@ export class ProxySessionDO {
       case FRAME_TYPES.WINDOW: {
         const s = this.streams.get(frame.streamId);
         if (s && frame.payload?.byteLength >= 4) {
-          const credit = new DataView(frame.payload.buffer, frame.payload.byteOffset, 4).getUint32(0, false);
+          const credit = new DataView(
+            frame.payload.buffer,
+            frame.payload.byteOffset,
+            4
+          ).getUint32(0, false);
           s.addCredit(credit);
         }
         break;
@@ -231,7 +236,9 @@ export class ProxySessionDO {
     this.streams.clear();
     try {
       this.ws?.close(1000);
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     this.ws = null;
   }
 }
