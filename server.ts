@@ -30,7 +30,11 @@ app.post('/api/cloudflare/verify', async (req: Request, res: Response) => {
     });
     const verifyData = (await verifyRes.json()) as any;
     if (!verifyData.success) {
-      return res.status(401).json({ success: false, error: 'Invalid Cloudflare API token.', details: verifyData.errors });
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid Cloudflare API token.',
+        details: verifyData.errors,
+      });
     }
     const accountsRes = await fetch('https://api.cloudflare.com/client/v4/accounts', {
       headers: { Authorization: `Bearer ${apiToken.trim()}`, 'Content-Type': 'application/json' },
@@ -119,7 +123,9 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
       );
       const subData = (await subRes.json()) as any;
       if (subData.success && subData.result?.subdomain) subdomain = subData.result.subdomain;
-    } catch {}
+    } catch {
+      /* non-fatal */
+    }
 
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
