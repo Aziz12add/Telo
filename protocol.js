@@ -1,6 +1,5 @@
 // protocol.js
-// Telegram WEB Proxy v1 binary frame codec and crypto engine
-// Reference: telegramdesktop/tproxy-server@52a5feb7
+// Telegram WEB Proxy binary frame codec and crypto engine
 
 export const FRAME_TYPES = Object.freeze({
   HELLO: 0x01,
@@ -188,15 +187,23 @@ export async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
 }
 
 /**
- * Encodes a frame into binary: [4-byte length][1-byte type][payload]
- * ALL integers in Big-Endian (littleEndian = false).
- * Length includes 1-byte type + payload.length.
+ * Encodes a frame with standard 8-byte header:
+ * [1 byte type][2 bytes streamId BE][1 byte flags][4 bytes payloadLen BE][payload]
  *
  * @param {number} type - FRAME_TYPES
+ * @param {number} [streamId=0] - 16-bit unsigned integer streamId
+ * @param {number} [flags=0] - 8-bit unsigned flags
  * @param {Uint8Array} [payload=new Uint8Array(0)]
  * @returns {Uint8Array}
  */
-export function encodeFrame(type, payload = new Uint8Array(0)) {
+export function encodeFrame(type, streamId = 0, flags = 0, payload = new Uint8Array(0)) {
+  // Support overload: encodeFrame(type, payload)
+  if (streamId instanceof Uint8Array || (typeof streamId === 'object' && streamId !== null && 'byteLength' in streamId)) {
+    payload = streamId;
+    streamId = 0;
+    flags = 0;
+  }
+
   const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
   const payloadLen = payloadBytes.byteLength;
 
@@ -204,68 +211,64 @@ export function encodeFrame(type, payload = new Uint8Array(0)) {
     throw new ProtocolError(`DATA frame payload ${payloadLen} exceeds 64KiB`, 1002);
   }
 
-  const frameLen = 1 + payloadLen;
-  if (frameLen > CARRIER_HARD_MAX) {
-    throw new ProtocolError(`Frame size ${frameLen} exceeds carrier hard max 2MiB`, 1002);
+  if (payloadLen > CARRIER_HARD_MAX) {
+    throw new ProtocolError(`Frame payload ${payloadLen} exceeds carrier hard max 2MiB`, 1002);
   }
 
-  const buffer = new Uint8Array(4 + frameLen);
+  const buffer = new Uint8Array(8 + payloadLen);
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
-  view.setUint32(0, frameLen, false); // Big-Endian 4-byte length
-  view.setUint8(4, type & 0xff);       // 1-byte type
+  view.setUint8(0, type & 0xff);
+  view.setUint16(1, streamId & 0xffff, false);
+  view.setUint8(3, flags & 0xff);
+  view.setUint32(4, payloadLen, false);
 
   if (payloadLen > 0) {
-    buffer.set(payloadBytes, 5);
+    buffer.set(payloadBytes, 8);
   }
 
   return buffer;
 }
 
 /**
- * Decodes a single frame from the buffer: [4-byte length][1-byte type][payload]
- * ALL integers in Big-Endian (littleEndian = false).
+ * Decodes a single frame from the buffer:
+ * Header: [1 byte type][2 bytes streamId BE][1 byte flags][4 bytes payloadLen BE][payload]
  *
  * @param {Uint8Array} buffer
- * @returns {{ frame: { type: number, payload: Uint8Array } | null, remainder: Uint8Array }}
+ * @returns {{ frame: { type: number, streamId: number, flags: number, payload: Uint8Array } | null, remainder: Uint8Array }}
  */
 export function decodeFrame(buffer) {
   if (!(buffer instanceof Uint8Array)) {
     throw new TypeError('Buffer must be an instance of Uint8Array');
   }
 
-  if (buffer.byteLength < 4) {
+  if (buffer.byteLength < 8) {
     return { frame: null, remainder: buffer };
   }
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const frameLen = view.getUint32(0, false); // Big-Endian length of (type + payload)
+  const type = view.getUint8(0);
+  const streamId = view.getUint16(1, false);
+  const flags = view.getUint8(3);
+  const payloadLen = view.getUint32(4, false);
 
-  if (frameLen === 0) {
-    throw new ProtocolError('Invalid frame length: 0', 1002);
+  if (payloadLen > CARRIER_HARD_MAX) {
+    throw new ProtocolError(`Payload length ${payloadLen} exceeds carrier hard max 2MiB`, 1002);
   }
 
-  if (frameLen > CARRIER_HARD_MAX) {
-    throw new ProtocolError(`Frame length ${frameLen} exceeds carrier hard max 2MiB`, 1002);
-  }
-
-  if (buffer.byteLength < 4 + frameLen) {
-    // Incomplete frame, wait for more data
+  if (buffer.byteLength < 8 + payloadLen) {
     return { frame: null, remainder: buffer };
   }
-
-  const type = view.getUint8(4);
-  const payloadLen = frameLen - 1;
 
   if (type === FRAME_TYPES.DATA && payloadLen > MAX_DATA_CHUNK) {
     throw new ProtocolError(`DATA frame payload ${payloadLen} exceeds 64KiB`, 1002);
   }
 
-  const payload = buffer.slice(5, 5 + payloadLen);
-  const remainder = buffer.slice(4 + frameLen);
+  const payload = buffer.slice(8, 8 + payloadLen);
+  const remainder = buffer.slice(8 + payloadLen);
 
   return {
-    frame: { type, payload },
+    frame: { type, streamId, flags, payload },
     remainder,
   };
 }
@@ -274,13 +277,13 @@ export function decodeFrame(buffer) {
  * Decodes all complete frames available in the buffer.
  *
  * @param {Uint8Array} buffer
- * @returns {{ frames: Array<{ type: number, payload: Uint8Array }>, remainder: Uint8Array }}
+ * @returns {{ frames: Array<{ type: number, streamId: number, flags: number, payload: Uint8Array }>, remainder: Uint8Array }}
  */
 export function decodeFrames(buffer) {
   const frames = [];
   let current = buffer;
 
-  while (current.byteLength >= 4) {
+  while (current.byteLength >= 8) {
     const { frame, remainder } = decodeFrame(current);
     if (!frame) {
       break;
@@ -290,172 +293,4 @@ export function decodeFrames(buffer) {
   }
 
   return { frames, remainder: current };
-}
-
-/**
- * Creates an independent AES-256-CTR streaming context.
- * Maintains counter state and keystream offset continuously across arbitrary fragmentation.
- * NEVER resets counter across DATA boundaries.
- *
- * @param {Uint8Array} key - 32-byte AES key
- * @param {Uint8Array} iv - 16-byte initial counter
- * @returns {{
- *   update: (data: Uint8Array) => Promise<Uint8Array>,
- *   encrypt: (data: Uint8Array) => Promise<Uint8Array>,
- *   decrypt: (data: Uint8Array) => Promise<Uint8Array>
- * }}
- */
-export function createCtrContext(key, iv) {
-  if (key.byteLength !== 32) {
-    throw new Error('AES-256-CTR requires 32-byte key');
-  }
-  if (iv.byteLength !== 16) {
-    throw new Error('AES-256-CTR requires 16-byte IV');
-  }
-
-  const keyBytes = new Uint8Array(key);
-  const counter = new Uint8Array(iv);
-  let keystreamBuffer = new Uint8Array(0);
-  let keystreamOffset = 0;
-  let cryptoKeyPromise = null;
-
-  function getCryptoKey() {
-    if (!cryptoKeyPromise) {
-      cryptoKeyPromise = crypto.subtle.importKey(
-        'raw',
-        keyBytes,
-        { name: 'AES-CTR', length: 256 },
-        false,
-        ['encrypt']
-      );
-    }
-    return cryptoKeyPromise;
-  }
-
-  function incrementCounter() {
-    for (let i = 15; i >= 0; i--) {
-      counter[i] = (counter[i] + 1) & 0xff;
-      if (counter[i] !== 0) break;
-    }
-  }
-
-  async function generateKeystreamBlocks(blockCount = 64) {
-    const cryptoKey = await getCryptoKey();
-    const zeros = new Uint8Array(blockCount * 16);
-    const startingCounter = new Uint8Array(counter);
-
-    // Advance counter for the requested number of blocks
-    for (let b = 0; b < blockCount; b++) {
-      incrementCounter();
-    }
-
-    const encrypted = await crypto.subtle.encrypt(
-      {
-        name: 'AES-CTR',
-        counter: startingCounter,
-        length: 64,
-      },
-      cryptoKey,
-      zeros
-    );
-
-    keystreamBuffer = new Uint8Array(encrypted);
-    keystreamOffset = 0;
-  }
-
-  async function processStream(data) {
-    const input = data instanceof Uint8Array ? data : new Uint8Array(data);
-    const output = new Uint8Array(input.byteLength);
-
-    for (let i = 0; i < input.byteLength; i++) {
-      if (keystreamOffset >= keystreamBuffer.byteLength) {
-        await generateKeystreamBlocks(64);
-      }
-      output[i] = input[i] ^ keystreamBuffer[keystreamOffset++];
-    }
-
-    return output;
-  }
-
-  return {
-    update: processStream,
-    encrypt: processStream,
-    decrypt: processStream,
-  };
-}
-
-/**
- * Creates 4 independent AES-256-CTR contexts per stream:
- * 1. outerClientDecrypt: Outer MTProxy layer client -> server
- * 2. innerClientEncrypt: Inner Telegram obfuscation layer client -> server
- * 3. innerServerDecrypt: Inner Telegram obfuscation layer server -> client
- * 4. outerServerEncrypt: Outer MTProxy layer server -> client
- */
-export function createStreamCryptoContexts(keys) {
-  return {
-    outerClientDecrypt: createCtrContext(keys.clientDecryptKey, keys.clientDecryptIv),
-    innerClientEncrypt: createCtrContext(keys.upstreamEncryptKey, keys.upstreamEncryptIv),
-    innerServerDecrypt: createCtrContext(keys.upstreamDecryptKey, keys.upstreamDecryptIv),
-    outerServerEncrypt: createCtrContext(keys.clientEncryptKey, keys.clientEncryptIv),
-  };
-}
-
-// Unit test: encodes then decodes HELLO and checks length
-export async function _testProtocol() {
-  const helloPayload = new Uint8Array([0xaa, 0xbb, 0xcc]);
-  const encoded = encodeFrame(FRAME_TYPES.HELLO, helloPayload);
-
-  // [4-byte length = 4][1-byte type = 0x01][3-byte payload] = 8 bytes total
-  if (encoded.byteLength !== 8) {
-    throw new Error(`Expected 8 bytes, got ${encoded.byteLength}`);
-  }
-
-  const view = new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength);
-  const frameLen = view.getUint32(0, false);
-  if (frameLen !== 4) {
-    throw new Error(`Expected frame length 4, got ${frameLen}`);
-  }
-
-  const { frame, remainder } = decodeFrame(encoded);
-  if (!frame) {
-    throw new Error('Failed to decode frame');
-  }
-  if (frame.type !== FRAME_TYPES.HELLO) {
-    throw new Error(`Expected type 0x01, got ${frame.type}`);
-  }
-  if (frame.payload.byteLength !== 3) {
-    throw new Error(`Expected payload length 3, got ${frame.payload.byteLength}`);
-  }
-  if (frame.payload[0] !== 0xaa || frame.payload[1] !== 0xbb || frame.payload[2] !== 0xcc) {
-    throw new Error('Payload mismatch');
-  }
-  if (remainder.byteLength !== 0) {
-    throw new Error(`Expected empty remainder, got ${remainder.byteLength}`);
-  }
-
-  // Test CTR context streaming continuity across chunks
-  const key = new Uint8Array(32);
-  const iv = new Uint8Array(16);
-  key.fill(0x42);
-  iv.fill(0x24);
-
-  const enc = createCtrContext(key, iv);
-  const dec = createCtrContext(key, iv);
-
-  const chunk1 = new Uint8Array([1, 2, 3, 4, 5]);
-  const chunk2 = new Uint8Array([6, 7, 8, 9, 10]);
-
-  const cipher1 = await enc.update(chunk1);
-  const cipher2 = await enc.update(chunk2);
-
-  const plain1 = await dec.update(cipher1);
-  const plain2 = await dec.update(cipher2);
-
-  for (let i = 0; i < 5; i++) {
-    if (plain1[i] !== chunk1[i] || plain2[i] !== chunk2[i]) {
-      throw new Error('CTR context streaming mismatch');
-    }
-  }
-
-  return true;
 }

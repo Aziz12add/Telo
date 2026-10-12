@@ -1,4 +1,4 @@
-// index.js — Worker router (bridge + session + ws → DO)
+// index.js — Worker router (bridge + session + ws -> DO)
 import { ProxySessionDO } from './session.js';
 import {
   verifyBridgeCapability,
@@ -15,7 +15,7 @@ function nonce() {
 }
 
 function decoy() {
-  return new Response(`<!doctype html><meta charset=utf-8><title>OK</title><p>OK</p>`, {
+  return new Response('<!doctype html><meta charset=utf-8><title>OK</title><p>OK</p>', {
     status: 200,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
@@ -28,39 +28,49 @@ function bridgePage(n, host, token, wsUrl, link) {
   const html = `<!DOCTYPE html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Telegram WEB Proxy Bridge</title>
-<style nonce="${n}">body{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
-.card{background:#1e293b;border-radius:12px;padding:24px;max-width:420px;width:90%}
-a{display:block;text-align:center;background:#0284c7;color:#fff;text-decoration:none;padding:12px;border-radius:8px;margin-top:12px}
-#log{font:12px monospace;margin-top:12px;color:#38bdf8}</style></head>
+<style nonce="${n}">body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.card{background:#1e293b;border-radius:12px;padding:24px;max-width:420px;width:90%;box-shadow:0 10px 25px rgba(0,0,0,0.5)}
+h1{font-size:1.25rem;margin:0 0 8px 0;color:#38bdf8}
+p{font-size:0.875rem;color:#94a3b8;margin:4px 0}
+a{display:block;text-align:center;background:#0284c7;color:#fff;text-decoration:none;padding:12px;border-radius:8px;margin-top:16px;font-weight:600}
+#log{font:12px monospace;margin-top:14px;padding:8px;background:#0f172a;border-radius:6px;color:#38bdf8;white-space:pre-wrap;word-break:break-all}</style></head>
 <body><div class=card>
-<h1>WEB Proxy Bridge</h1>
+<h1>Telegram WEB Proxy</h1>
 <p>Host: ${host}</p>
 <a href="${link}">Open in Telegram</a>
-<div id=log>Connecting…</div>
+<div id=log>Connecting to relay…</div>
 </div>
 <script nonce="${n}">
 (function(){
-  var ws=new WebSocket(${JSON.stringify(wsUrl)});
-  ws.binaryType='arraybuffer';
-  var log=document.getElementById('log');
-  ws.onopen=function(){
-    log.textContent='WS open, HELLO';
-    var h=new Uint8Array(8); h[0]=0x01; ws.send(h);
+  var ws = new WebSocket(${JSON.stringify(wsUrl)});
+  ws.binaryType = 'arraybuffer';
+  var log = document.getElementById('log');
+  ws.onopen = function(){
+    log.textContent = 'WS connected. Sending HELLO...';
+    // 8-byte frame: [type=1][streamId=0(2B)][flags=0(1B)][len=0(4B)]
+    var h = new Uint8Array(8);
+    h[0] = 0x01;
+    ws.send(h);
   };
-  ws.onmessage=function(e){
-    if(e.data && e.data.byteLength>=1){
-      var t=new DataView(e.data).getUint8(0);
-      if(t===0x02) log.textContent='WELCOME — ready';
+  ws.onmessage = function(e){
+    if (e.data && e.data.byteLength >= 8) {
+      var view = new DataView(e.data);
+      var type = view.getUint8(0);
+      if (type === 0x02) {
+        log.textContent = 'WELCOME received! Bridge is healthy & ready for MTProto.';
+      }
     }
   };
-  ws.onerror=function(){ log.textContent='WS error'; };
+  ws.onerror = function(){ log.textContent = 'WS connection error'; };
+  ws.onclose = function(){ log.textContent += '\\nWS closed'; };
 })();
 </script></body></html>`;
+
   return new Response(html, {
     status: 200,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-\( {n}'; style-src 'nonce- \){n}'; connect-src 'self' wss://${host}`,
+      'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${n}'; style-src 'nonce-${n}'; connect-src 'self' wss://${host}`,
       'Cache-Control': 'no-store',
     },
   });
@@ -100,7 +110,7 @@ export default {
         JSON.stringify({
           ok: true,
           token,
-          wsUrl: `wss://\( {host}/ws?token= \){encodeURIComponent(token)}`,
+          wsUrl: `wss://${host}/ws?token=${encodeURIComponent(token)}`,
         }),
         { headers: { 'Content-Type': 'application/json' } }
       );
@@ -112,8 +122,8 @@ export default {
         const sessionId = crypto.randomUUID();
         const timestamp = Math.floor(Date.now() / 1000);
         const token = await signSessionToken(env.PROXY_SECRET, sessionId, timestamp);
-        const wsUrl = `wss://\( {host}/ws?token= \){encodeURIComponent(token)}`;
-        const link = `https://t.me/webproxy?server=\( {encodeURIComponent(host)}&secret= \){encodeURIComponent(env.PROXY_SECRET)}`;
+        const wsUrl = `wss://${host}/ws?token=${encodeURIComponent(token)}`;
+        const link = `https://t.me/webproxy?server=${encodeURIComponent(host)}&secret=${encodeURIComponent(env.PROXY_SECRET)}`;
         return bridgePage(nonce(), host, token, wsUrl, link);
       }
       return decoy();
