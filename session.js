@@ -1,389 +1,347 @@
-// session.js
-// Cloudflare Durable Object ProxySessionDO for Telegram Web Proxy v1
-
+// session.js - FIXED VERSION FOR Telo
+// Cloudflare SQLite Durable Object ProxySessionDO for Telegram WEB Proxy v1
 import { connect } from 'cloudflare:sockets';
 import {
   FRAME_TYPES,
+  MAX_DATA_CHUNK,
+  CARRIER_HARD_MAX,
   encodeFrame,
   decodeFrames,
-  verifySessionToken,
-  parseSecret,
+  createStreamCryptoContexts,
+  ProtocolError,
 } from './protocol.js';
 
-export const TELEGRAM_DCS = Object.freeze({
-  1: { ip: '149.154.175.50', port: 443 },
-  2: { ip: '149.154.167.51', port: 443 },
-  3: { ip: '149.154.175.100', port: 443 },
-  4: { ip: '149.154.167.91', port: 443 },
-  5: { ip: '91.108.56.165', port: 443 },
+export const TELEGRAM_DC_MAP = Object.freeze({
+  1: { ip: '149.154.175.50', port: 443, wsHost: 'pluto.web.telegram.org' },
+  2: { ip: '149.154.167.51', port: 443, wsHost: 'venus.web.telegram.org' },
+  3: { ip: '149.154.175.100', port: 443, wsHost: 'aurora.web.telegram.org' },
+  4: { ip: '149.154.167.91', port: 443, wsHost: 'vesta.web.telegram.org' },
+  5: { ip: '91.108.56.165', port: 443, wsHost: 'flora.web.telegram.org' },
 });
 
-export const DEFAULT_DC_IP = '149.154.167.51';
-export const DEFAULT_DC_PORT = 443;
+const MAX_STREAMS_PER_SESSION = 32;
+const MAX_DO_PENDING_BYTES = 32 * 1024 * 1024;
+const MAX_DO_PENDING_ITEMS = 32768;
+const MAX_DIRECTION_PENDING_BYTES = 4 * 1024 * 1024;
+const INITIAL_STREAM_WINDOW = 4 * 1024 * 1024;
+const MAX_BITMAP_BYTES = 2 * 1024 * 1024;
+const MAX_ID = MAX_BITMAP_BYTES * 8; // 16,777,216
+const MAX_CONCURRENT_DIALS = 4;
+const MAX_QUEUED_DIALS = 256;
+const IDLE_TIMEOUT_MS = 300000;
+const MAX_TOMBSTONES = 1024;
 
-const WINDOW_MAX_SIZE = 4 * 1024 * 1024; // 4 MiB flow-control limit
-const WINDOW_INITIAL_SIZE = 1 * 1024 * 1024; // 1 MiB initial stream window
-const CHUNK_SIZE = 64 * 1024; // 64 KiB chunks for outbound DATA frames
-const MAX_CONCURRENT_STREAMS = 32;
-
-class StreamSession {
-  /**
-   * @param {number} streamId
-   * @param {string} targetIp
-   * @param {number} targetPort
-   * @param {ProxySessionDO} parent
-   */
-  constructor(streamId, targetIp, targetPort, parent) {
+class StreamContext {
+  constructor(streamId, dcId, abortController) {
     this.streamId = streamId;
-    this.targetIp = targetIp;
-    this.targetPort = targetPort;
-    this.parent = parent;
-
+    this.dcId = dcId;
+    this.abortController = abortController;
+    this.inboundWindow = INITIAL_STREAM_WINDOW;
+    this.outboundWindow = INITIAL_STREAM_WINDOW;
+    this.inboundPendingBytes = 0;
     this.socket = null;
     this.writer = null;
     this.reader = null;
-
     this.closed = false;
-    this.egressWindow = WINDOW_INITIAL_SIZE; // Client's available receive credit for this stream
-    this.ingressWindow = WINDOW_MAX_SIZE;   // Our remaining allowance for incoming client data
-  }
-
-  async start() {
-    try {
-      this.socket = connect({
-        hostname: this.targetIp,
-        port: this.targetPort,
-      });
-
-      this.writer = this.socket.writable.getWriter();
-      this.reader = this.socket.readable.getReader();
-
-      this.pumpUpstreamToClient();
-    } catch (err) {
-      this.closeStream(0x01); // Error code
-    }
-  }
-
-  async writeUpstream(payload) {
-    if (this.closed || !this.writer) return;
-
-    try {
-      await this.writer.write(payload);
-
-      // Decrement ingress window and refill if below 50%
-      this.ingressWindow -= payload.byteLength;
-      if (this.ingressWindow <= WINDOW_MAX_SIZE / 2) {
-        const credit = WINDOW_MAX_SIZE - this.ingressWindow;
-        this.ingressWindow += credit;
-        this.parent.sendWindowUpdate(this.streamId, credit);
-      }
-    } catch {
-      this.closeStream(0x02);
-    }
-  }
-
-  updateEgressWindow(credit) {
-    this.egressWindow = Math.min(this.egressWindow + credit, WINDOW_MAX_SIZE);
-  }
-
-  async pumpUpstreamToClient() {
-    try {
-      while (!this.closed && this.reader) {
-        const { value, done } = await this.reader.read();
-        if (done) break;
-
-        if (value && value.byteLength > 0) {
-          let offset = 0;
-          while (offset < value.byteLength && !this.closed) {
-            const chunkSize = Math.min(CHUNK_SIZE, value.byteLength - offset);
-            const chunk = value.subarray(offset, offset + chunkSize);
-
-            this.parent.sendDataFrame(this.streamId, chunk);
-            this.egressWindow -= chunkSize;
-            offset += chunkSize;
-
-            // Simple wait if client egress window is fully saturated
-            if (this.egressWindow <= 0) {
-              await this.waitForEgressCredit();
-            }
-          }
-        }
-      }
-    } catch {
-      // Socket ended or reset
-    } finally {
-      this.closeStream(0x00);
-    }
-  }
-
-  async waitForEgressCredit() {
-    let attempts = 0;
-    while (this.egressWindow <= 0 && !this.closed && attempts < 50) {
-      await new Promise((r) => setTimeout(r, 20));
-      attempts++;
-    }
-  }
-
-  closeStream(code = 0) {
-    if (this.closed) return;
-    this.closed = true;
-
-    try {
-      if (this.writer) this.writer.close();
-      if (this.reader) this.reader.cancel();
-      if (this.socket) this.socket.close();
-    } catch {
-      // Ignored
-    }
-
-    this.parent.notifyStreamClosed(this.streamId, code);
+    this.ciphers = null;
+    this.creditResolver = null;
   }
 }
 
 export class ProxySessionDO {
-  /**
-   * @param {DurableObjectState} state
-   * @param {object} env
-   */
-  constructor(state, env) {
-    this.state = state;
+  constructor(ctx, env) {
+    this.ctx = ctx;
     this.env = env;
-
-    /** @type {WebSocket|null} */
     this.ws = null;
-    /** @type {Map<number, StreamSession>} */
-    this.streams = new Map();
-    /** @type {Uint8Array} */
     this.rxBuffer = new Uint8Array(0);
-    this.isSessionAlive = false;
+    this.streams = new Map();
+    this.tombstones = new Set();
+    this.usedIdBitmap = new Uint8Array(65536);
+    this.activeDials = 0;
+    this.dialQueue = [];
+    this.totalPendingBytes = 0;
+    this.totalPendingItems = 0;
+    try {
+      this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS session_meta (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);`);
+    } catch {}
   }
 
-  /**
-   * Main Durable Object entry point
-   * @param {Request} request
-   * @returns {Promise<Response>}
-   */
+  isIdUsed(streamId) {
+    if (streamId >= MAX_ID) return true;
+    if (this.tombstones.has(streamId)) return true;
+    const byteIndex = Math.floor(streamId / 8);
+    if (byteIndex >= this.usedIdBitmap.length) return false;
+    const bitIndex = streamId % 8;
+    return (this.usedIdBitmap[byteIndex] & (1 << bitIndex))!== 0;
+  }
+
+  markIdUsed(streamId) {
+    if (streamId >= MAX_ID) return;
+    let byteIndex = Math.floor(streamId / 8);
+    if (byteIndex >= this.usedIdBitmap.length) {
+      if (byteIndex >= MAX_BITMAP_BYTES) return;
+      const newSize = Math.min(MAX_BITMAP_BYTES, Math.max(byteIndex + 1, this.usedIdBitmap.length * 2));
+      const expanded = new Uint8Array(newSize);
+      expanded.set(this.usedIdBitmap, 0);
+      this.usedIdBitmap = expanded;
+    }
+    this.usedIdBitmap[byteIndex] |= 1 << (streamId % 8);
+  }
+
+  touchIdleTimer() {
+    try { this.ctx.storage.setAlarm(Date.now() + IDLE_TIMEOUT_MS); } catch {}
+  }
+
+  async alarm() {
+    this.closeAllStreams(0x00);
+    try { this.ws?.close(1000, 'idle'); } catch {}
+    this.ws = null;
+  }
+
   async fetch(request) {
-    const url = new URL(request.url);
-
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket upgrade', { status: 426 });
+    // FIXED: Check internal auth header from server.ts instead of?token=
+    const internalAuth = request.headers.get('X-Internal-Auth');
+    if (internalAuth!== 'trusted-worker') {
+      return new Response('Unauthorized', { status: 401 });
     }
-
-    const token = url.searchParams.get('token');
-    if (!token) {
-      return new Response('Missing session token', { status: 401 });
+    if (request.headers.get('Upgrade')!== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 });
     }
-
-    const secret = this.env.PROXY_SECRET;
-    if (!secret) {
-      return new Response('Server configuration error: missing PROXY_SECRET', { status: 500 });
-    }
-
-    const auth = await verifySessionToken(secret, token);
-    if (!auth.valid) {
-      return new Response('Unauthorized token', { status: 403 });
-    }
-
-    // @ts-ignore Cloudflare WebSocketPair
     const pair = new WebSocketPair();
-    const [clientSocket, serverSocket] = Object.values(pair);
-
-    // @ts-ignore accept server socket
-    serverSocket.accept();
-    this.ws = serverSocket;
-    this.isSessionAlive = true;
-
-    this.bindWebSocketHandlers(serverSocket);
-
-    return new Response(null, {
-      status: 101,
-      // @ts-ignore webSocket response binding
-      webSocket: clientSocket,
-    });
+    const [client, server] = Object.values(pair);
+    server.accept();
+    this.ws = server;
+    this.touchIdleTimer();
+    this.bindCarrierSocket(server);
+    return new Response(null, { status: 101, webSocket: client });
   }
 
-  /**
-   * @param {WebSocket} ws
-   */
-  bindWebSocketHandlers(ws) {
+  bindCarrierSocket(ws) {
     ws.addEventListener('message', async (event) => {
+      this.touchIdleTimer();
       try {
-        let chunk;
-        if (typeof event.data === 'string') {
-          chunk = new TextEncoder().encode(event.data);
-        } else if (event.data instanceof ArrayBuffer) {
-          chunk = new Uint8Array(event.data);
-        } else {
-          chunk = new Uint8Array(await event.data.arrayBuffer());
+        let chunk = event.data instanceof ArrayBuffer? new Uint8Array(event.data) : new Uint8Array(await event.data.arrayBuffer());
+        // Optimized concat
+        if (this.rxBuffer.length === 0) this.rxBuffer = chunk;
+        else {
+          const next = new Uint8Array(this.rxBuffer.length + chunk.length);
+          next.set(this.rxBuffer, 0);
+          next.set(chunk, this.rxBuffer.length);
+          this.rxBuffer = next;
         }
+        if (this.rxBuffer.length > CARRIER_HARD_MAX) throw new ProtocolError('Carrier overflow', 1009);
 
-        this.appendRxChunk(chunk);
-        await this.processFrames();
+        const { frames, remainder } = decodeFrames(this.rxBuffer);
+        this.rxBuffer = remainder;
+        for (const frame of frames) await this.handleFrame(frame);
       } catch (err) {
-        this.closeAll('Frame decoding error');
+        this.closeCarrierProtocolViolation(err.message || 'decode error', 1002);
       }
     });
-
-    ws.addEventListener('close', () => {
-      this.closeAll('Client disconnected');
-    });
-
-    ws.addEventListener('error', () => {
-      this.closeAll('WebSocket error');
-    });
+    ws.addEventListener('close', () => { this.closeAllStreams(0x00); this.ws = null; });
+    ws.addEventListener('error', () => { this.closeAllStreams(0x01); this.ws = null; });
   }
 
-  /**
-   * @param {Uint8Array} chunk
-   */
-  appendRxChunk(chunk) {
-    const next = new Uint8Array(this.rxBuffer.byteLength + chunk.byteLength);
-    next.set(this.rxBuffer, 0);
-    next.set(chunk, this.rxBuffer.byteLength);
-    this.rxBuffer = next;
-  }
-
-  async processFrames() {
-    if (this.rxBuffer.byteLength === 0) return;
-
-    const { frames, remainder } = decodeFrames(this.rxBuffer);
-    this.rxBuffer = remainder;
-
-    for (const frame of frames) {
-      await this.handleFrame(frame);
-    }
-  }
-
-  /**
-   * Dispatches and processes an individual protocol frame
-   * @param {{ type: number, streamId: number, flags: number, payload: Uint8Array }} frame
-   */
   async handleFrame(frame) {
     switch (frame.type) {
       case FRAME_TYPES.HELLO: {
-        // Send WELCOME frame back to client
-        const welcomePayload = new Uint8Array(8);
-        const view = new DataView(welcomePayload.buffer);
-        view.setUint32(0, WINDOW_INITIAL_SIZE, false);
-        view.setUint32(4, MAX_CONCURRENT_STREAMS, false);
-
-        this.sendRawFrame(FRAME_TYPES.WELCOME, 0, 0, welcomePayload);
+        const welcome = new Uint8Array(8);
+        const view = new DataView(welcome.buffer);
+        view.setUint32(0, INITIAL_STREAM_WINDOW, false);
+        view.setUint32(4, MAX_STREAMS_PER_SESSION, false);
+        this.sendFrame(FRAME_TYPES.WELCOME, welcome);
         break;
       }
-
       case FRAME_TYPES.OPEN: {
-        const streamId = frame.streamId;
-        if (this.streams.has(streamId)) {
-          return;
-        }
-
-        if (this.streams.size >= MAX_CONCURRENT_STREAMS) {
-          this.notifyStreamClosed(streamId, 0x03); // Max streams reached
-          return;
-        }
-
-        // Parse optional target DC from payload: [1B dc_id] or [4B IPv4][2B port]
-        let targetIp = DEFAULT_DC_IP;
-        let targetPort = DEFAULT_DC_PORT;
-
-        if (frame.payload.byteLength >= 1) {
-          const dcId = frame.payload[0];
-          if (TELEGRAM_DCS[dcId]) {
-            targetIp = TELEGRAM_DCS[dcId].ip;
-            targetPort = TELEGRAM_DCS[dcId].port;
-          }
-        }
-
-        const stream = new StreamSession(streamId, targetIp, targetPort, this);
-        this.streams.set(streamId, stream);
-        await stream.start();
+        if (frame.payload.length < 4) throw new ProtocolError('Malformed OPEN', 1002);
+        const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+        const streamId = view.getUint32(0, false);
+        const dcId = frame.payload.length >= 5? view.getUint8(4) : 2;
+        if (this.isIdUsed(streamId) || this.streams.has(streamId)) return;
+        if (this.streams.size >= MAX_STREAMS_PER_SESSION) { this.sendStreamClose(streamId, 0x03); return; }
+        this.markIdUsed(streamId);
+        await this.queueDial(streamId, dcId);
         break;
       }
-
       case FRAME_TYPES.DATA: {
-        const stream = this.streams.get(frame.streamId);
-        if (stream && frame.payload.byteLength > 0) {
-          await stream.writeUpstream(frame.payload);
-        }
+        if (frame.payload.length < 4) throw new ProtocolError('Malformed DATA', 1002);
+        const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+        const streamId = view.getUint32(0, false);
+        const data = frame.payload.subarray(4);
+        if (data.length > MAX_DATA_CHUNK) throw new ProtocolError('DATA >64KiB', 1002);
+        const stream = this.streams.get(streamId);
+        if (!stream || stream.closed) return;
+        if (this.totalPendingBytes + data.length > MAX_DO_PENDING_BYTES) throw new ProtocolError('DO pending overflow', 1009);
+        await this.forwardDataUpstream(stream, data);
         break;
       }
-
       case FRAME_TYPES.WINDOW: {
-        const stream = this.streams.get(frame.streamId);
-        if (stream && frame.payload.byteLength >= 4) {
-          const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, 4);
-          const credit = view.getUint32(0, false);
-          stream.updateEgressWindow(credit);
+        if (frame.payload.length < 8) throw new ProtocolError('Malformed WINDOW', 1002);
+        const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+        const streamId = view.getUint32(0, false);
+        const credit = view.getUint32(4, false);
+        const stream = this.streams.get(streamId);
+        if (stream &&!stream.closed) {
+          stream.outboundWindow += credit;
+          if (stream.creditResolver) { stream.creditResolver(); stream.creditResolver = null; }
         }
         break;
       }
-
-      case FRAME_TYPES.PING: {
-        this.sendRawFrame(FRAME_TYPES.PONG, frame.streamId, 0, frame.payload);
-        break;
-      }
-
-      case FRAME_TYPES.PONG: {
-        break;
-      }
-
+      case FRAME_TYPES.PING: this.sendFrame(FRAME_TYPES.PONG, frame.payload); break;
       case FRAME_TYPES.CLOSE: {
-        const stream = this.streams.get(frame.streamId);
-        if (stream) {
-          this.streams.delete(frame.streamId);
-          stream.closeStream(0x00);
+        if (frame.payload.length >= 4) {
+          const view = new DataView(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength);
+          this.closeStream(view.getUint32(0, false), 0x00);
         }
         break;
       }
     }
   }
 
-  sendDataFrame(streamId, payload) {
-    this.sendRawFrame(FRAME_TYPES.DATA, streamId, 0, payload);
+  async queueDial(streamId, dcId) {
+    if (this.dialQueue.length >= MAX_QUEUED_DIALS) { this.sendStreamClose(streamId, 0x04); return; }
+    const ac = new AbortController();
+    const stream = new StreamContext(streamId, dcId, ac);
+    this.streams.set(streamId, stream);
+    if (this.activeDials < MAX_CONCURRENT_DIALS) this.executeDial(stream);
+    else this.dialQueue.push(stream);
   }
 
-  sendWindowUpdate(streamId, credit) {
-    const payload = new Uint8Array(4);
-    const view = new DataView(payload.buffer);
-    view.setUint32(0, credit, false);
-    this.sendRawFrame(FRAME_TYPES.WINDOW, streamId, 0, payload);
-  }
-
-  notifyStreamClosed(streamId, code = 0) {
-    this.streams.delete(streamId);
-    const payload = new Uint8Array(1);
-    payload[0] = code & 0xff;
-    this.sendRawFrame(FRAME_TYPES.CLOSE, streamId, 0, payload);
-  }
-
-  sendRawFrame(type, streamId, flags, payload) {
-    if (!this.ws || !this.isSessionAlive) return;
-
+  async executeDial(stream) {
+    this.activeDials++;
+    const targetDc = TELEGRAM_DC_MAP[stream.dcId] || TELEGRAM_DC_MAP[2];
+    let timeout;
     try {
-      const frameBuffer = encodeFrame(type, streamId, flags, payload);
-      this.ws.send(frameBuffer);
+      timeout = setTimeout(() => stream.abortController.abort(), 10000);
+      // FIXED: correct cloudflare:sockets API
+      const socket = await connect(`${targetDc.ip}:${targetDc.port}`);
+      clearTimeout(timeout);
+      if (stream.closed || stream.abortController.signal.aborted) { try { socket.close(); } catch {} return; }
+
+      // FIXED: Create CTR contexts - memory only, never persisted
+      // In real MTProxy, keys derived from outer handshake. For v1 we use dummy zero keys for relay mode
+      // because Telegram DC does its own MTProto encryption inside.
+      const dummyKey = new Uint8Array(32); const dummyIv = new Uint8Array(16);
+      // For production, replace with keys derived from MTProxy outer layer
+      stream.ciphers = createStreamCryptoContexts({
+        clientDecryptKey: dummyKey, clientDecryptIv: dummyIv,
+        upstreamEncryptKey: dummyKey, upstreamEncryptIv: dummyIv,
+        upstreamDecryptKey: dummyKey, upstreamDecryptIv: dummyIv,
+        clientEncryptKey: dummyKey, clientEncryptIv: dummyIv,
+      });
+
+      stream.socket = socket;
+      stream.writer = socket.writable.getWriter();
+      stream.reader = socket.readable.getReader();
+      this.pumpUpstreamToCarrier(stream);
     } catch {
-      this.closeAll('Error sending frame to WebSocket');
+      clearTimeout(timeout);
+      this.closeStream(stream.streamId, 0x01);
+    } finally {
+      this.activeDials--;
+      if (this.dialQueue.length > 0) this.executeDial(this.dialQueue.shift());
     }
   }
 
-  closeAll(reason = 'Session closed') {
-    if (!this.isSessionAlive) return;
-    this.isSessionAlive = false;
-
-    for (const stream of this.streams.values()) {
-      stream.closeStream(0x00);
-    }
-    this.streams.clear();
-
-    if (this.ws) {
-      try {
-        this.ws.close(1000, reason);
-      } catch {
-        // Ignored
+  async forwardDataUpstream(stream, data) {
+    if (stream.closed ||!stream.writer) return;
+    try {
+      this.totalPendingBytes += data.length;
+      this.totalPendingItems++;
+      stream.inboundPendingBytes += data.length;
+      // FIXED: If ciphers exist, decrypt outer then encrypt inner (for full MTProxy mode)
+      let out = data;
+      if (stream.ciphers) {
+        const dec = await stream.ciphers.outerClientDecrypt.decrypt(data);
+        out = await stream.ciphers.innerClientEncrypt.encrypt(dec);
       }
-      this.ws = null;
+      await stream.writer.write(out);
+      stream.inboundWindow -= data.length;
+      if (stream.inboundWindow <= INITIAL_STREAM_WINDOW / 2) {
+        const credit = INITIAL_STREAM_WINDOW - stream.inboundWindow;
+        stream.inboundWindow += credit;
+        this.sendStreamWindow(stream.streamId, credit);
+      }
+    } catch { this.closeStream(stream.streamId, 0x02); }
+    finally {
+      this.totalPendingBytes -= data.length;
+      this.totalPendingItems--;
+      stream.inboundPendingBytes -= data.length;
     }
+  }
+
+  async pumpUpstreamToCarrier(stream) {
+    try {
+      while (!stream.closed && stream.reader) {
+        const { value, done } = await stream.reader.read();
+        if (done) break;
+        if (!value?.length) continue;
+        let offset = 0;
+        while (offset < value.length &&!stream.closed) {
+          const chunkSize = Math.min(MAX_DATA_CHUNK, value.length - offset);
+          let chunk = value.subarray(offset, offset + chunkSize);
+          if (stream.ciphers) {
+            const dec = await stream.ciphers.innerServerDecrypt.decrypt(chunk);
+            chunk = await stream.ciphers.outerServerEncrypt.encrypt(dec);
+          }
+          const payload = new Uint8Array(4 + chunk.length);
+          new DataView(payload.buffer).setUint32(0, stream.streamId, false);
+          payload.set(chunk, 4);
+          this.sendFrame(FRAME_TYPES.DATA, payload);
+          offset += chunkSize;
+          stream.outboundWindow -= chunkSize;
+          if (stream.outboundWindow <= 0) await this.waitForStreamCredit(stream);
+        }
+      }
+    } catch {} finally { this.closeStream(stream.streamId, 0x00); }
+  }
+
+  waitForStreamCredit(stream) {
+    if (stream.outboundWindow > 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      stream.creditResolver = resolve;
+      setTimeout(() => { if (stream.creditResolver) { stream.creditResolver(); stream.creditResolver = null; } }, 5000);
+    });
+  }
+
+  sendStreamWindow(streamId, credit) {
+    const p = new Uint8Array(8); const v = new DataView(p.buffer);
+    v.setUint32(0, streamId, false); v.setUint32(4, credit, false);
+    this.sendFrame(FRAME_TYPES.WINDOW, p);
+  }
+  sendStreamClose(streamId, code = 0) {
+    const p = new Uint8Array(5); const v = new DataView(p.buffer);
+    v.setUint32(0, streamId, false); v.setUint8(4, code);
+    this.sendFrame(FRAME_TYPES.CLOSE, p);
+  }
+  sendFrame(type, payload = new Uint8Array(0)) {
+    if (!this.ws) return;
+    try { this.ws.send(encodeFrame(type, payload)); }
+    catch { this.closeCarrierProtocolViolation('write fail', 1002); }
+  }
+  closeStream(streamId, code = 0) {
+    const stream = this.streams.get(streamId);
+    if (!stream) return;
+    stream.closed = true;
+    try { stream.abortController.abort(); } catch {}
+    this.streams.delete(streamId);
+    this.tombstones.add(streamId);
+    if (this.tombstones.size > MAX_TOMBSTONES) {
+      const first = this.tombstones.values().next().value;
+      this.tombstones.delete(first);
+    }
+    if (stream.creditResolver) { stream.creditResolver(); stream.creditResolver = null; }
+    try { stream.writer?.close(); stream.reader?.cancel(); stream.socket?.close(); } catch {}
+    this.sendStreamClose(streamId, code);
+  }
+  closeAllStreams(code = 0) {
+    for (const id of [...this.streams.keys()]) this.closeStream(id, code);
+    for (const q of this.dialQueue) try { q.abortController.abort(); } catch {}
+    this.dialQueue = [];
+  }
+  closeCarrierProtocolViolation(reason, code = 1002) {
+    this.closeAllStreams(0x01);
+    try { this.ws?.close(code, reason); } catch {}
+    this.ws = null;
   }
 }
