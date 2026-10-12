@@ -4,7 +4,6 @@ import path from 'path';
 export interface WorkerBundleConfig {
   workerName: string;
   proxySecret: string;
-  /** Only first deploy should create the DO class */
   isFirstDeploy?: boolean;
 }
 
@@ -30,7 +29,6 @@ export function generateWebProxyBundle(config: WorkerBundleConfig): WorkerBundle
     ],
   };
 
-  // Avoid repeating new_sqlite_classes on every upload when possible
   if (isFirstDeploy) {
     metadata.migrations = { new_sqlite_classes: ['ProxySessionDO'] };
   }
