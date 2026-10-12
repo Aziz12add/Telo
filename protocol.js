@@ -62,7 +62,13 @@ export async function computeBridgeCapability(secret, hostname) {
   const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
   const host = String(hostname || '').trim().toLowerCase().split(':')[0];
   const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${host}`);
-  const key = await crypto.subtle.importKey('raw', secretBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    secretBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
   return toBase64UrlNoPad(await crypto.subtle.sign('HMAC', key, context));
 }
 
@@ -74,7 +80,13 @@ export async function verifyBridgeCapability(providedBridge, secret, hostname) {
 export async function signSessionToken(secret, sessionId, timestamp) {
   const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
   const data = new TextEncoder().encode(`session-v1\n\( {sessionId}\n \){timestamp}`);
-  const key = await crypto.subtle.importKey('raw', secretBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    secretBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
   const sigB64 = toBase64UrlNoPad(await crypto.subtle.sign('HMAC', key, data));
   return `\( {sessionId}. \){timestamp}.${sigB64}`;
 }
