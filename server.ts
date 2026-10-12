@@ -2,185 +2,206 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { generateWebProxyBundle } from './src/worker-runtime/bundle.ts';
+import { generateWebProxyBundle } from './src/worker-runtime/bundle';
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const isProduction = process.env.NODE_ENV === 'production';
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-function parseSecretHex(secretHex: string): void {
-  let s = String(secretHex || '').trim().toLowerCase();
-  if (s.startsWith('dd')) s = s.slice(2);
-  if (s.length !== 32 || !/^[0-9a-f]{32}$/.test(s)) {
-    throw new Error('Secret must be 32 hex chars (or dd + 32 hex)');
-  }
-}
+// Health check endpoint
+app.get('/healthz', (_req: Request, res: Response) => {
+  res.json({ status: 'ok', service: 'telo-fullstack-deployer', timestamp: Date.now() });
+});
 
+// Cloudflare API Token verification endpoint
 app.post('/api/cloudflare/verify', async (req: Request, res: Response) => {
   const { apiToken } = req.body;
   if (!apiToken || typeof apiToken !== 'string') {
     return res.status(400).json({ success: false, error: 'API token is required.' });
   }
+
   try {
-    const verifyRes = await fetch('https://api.cloudflare.com/client/v4/user/tokens/verify', {
-      headers: { Authorization: `Bearer ${apiToken.trim()}`, 'Content-Type': 'application/json' },
+    const cfRes = await fetch('https://api.cloudflare.com/client/v4/accounts', {
+      headers: {
+        Authorization: `Bearer ${apiToken.trim()}`,
+        'Content-Type': 'application/json',
+      },
     });
-    const verifyData = (await verifyRes.json()) as any;
-    if (!verifyData.success) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid Cloudflare API token.',
-        details: verifyData.errors,
-      });
+
+    const data = await cfRes.json() as any;
+
+    if (!cfRes.ok || !data.success) {
+      const errMsg = data.errors?.[0]?.message || 'Invalid Cloudflare API token or missing permissions.';
+      return res.status(400).json({ success: false, error: errMsg });
     }
-    const accountsRes = await fetch('https://api.cloudflare.com/client/v4/accounts', {
-      headers: { Authorization: `Bearer ${apiToken.trim()}`, 'Content-Type': 'application/json' },
-    });
-    const accountsData = (await accountsRes.json()) as any;
-    const accounts =
-      accountsData.success && Array.isArray(accountsData.result)
-        ? accountsData.result.map((acc: any) => ({ id: acc.id, name: acc.name }))
-        : [];
+
+    const accounts = (data.result || []).map((acc: any) => ({
+      id: acc.id,
+      name: acc.name,
+    }));
+
     return res.json({ success: true, accounts });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: 'Verify failed: ' + (err.message || 'network') });
+    return res.status(500).json({
+      success: false,
+      error: `Failed to contact Cloudflare: ${err.message || 'Network error'}`,
+    });
   }
 });
 
+// Cloudflare Worker Deployment endpoint (multipart ES modules + Durable Object)
 app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
   const { apiToken, accountId, workerName, proxySecret, isSimulation } = req.body;
 
-  const cleanWorkerName = String(workerName || 'telo-webproxy')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9-_]/g, '-');
-
-  let cleanSecret = String(proxySecret || '').trim().toLowerCase();
-  try {
-    parseSecretHex(cleanSecret);
-  } catch {
-    return res.status(400).json({
-      success: false,
-      error: 'Invalid proxySecret: need 32 hex chars (optional dd prefix).',
-    });
+  if (!workerName || !proxySecret) {
+    return res.status(400).json({ success: false, error: 'Missing workerName or proxySecret.' });
   }
 
+  // Simulation mode for quick testing
   if (isSimulation) {
-    const hostname = `${cleanWorkerName}.telo-preview.workers.dev`;
+    const simHost = `${workerName.toLowerCase()}.workers.dev`;
     return res.json({
       success: true,
-      hostname,
-      secret: cleanSecret,
-      tmeLink: `https://t.me/webproxy?server=\( {encodeURIComponent(hostname)}&secret= \){encodeURIComponent(cleanSecret)}`,
-      tgLink: `tg://webproxy?server=\( {encodeURIComponent(hostname)}&secret= \){encodeURIComponent(cleanSecret)}`,
+      hostname: simHost,
+      secret: proxySecret,
+      tmeLink: `https://t.me/webproxy?server=${encodeURIComponent(simHost)}&secret=${encodeURIComponent(proxySecret)}`,
+      tgLink: `tg://webproxy?server=${encodeURIComponent(simHost)}&secret=${encodeURIComponent(proxySecret)}`,
     });
   }
 
   if (!apiToken || !accountId) {
-    return res.status(400).json({ success: false, error: 'apiToken and accountId are required.' });
+    return res.status(400).json({ success: false, error: 'apiToken and accountId are required for real deployment.' });
   }
 
   try {
+    // 1. Fetch account workers subdomain
+    const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+      headers: {
+        Authorization: `Bearer ${apiToken.trim()}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const subData = await subRes.json() as any;
+    const subdomain = subData.result?.subdomain || `${accountId.substring(0, 8)}.workers.dev`;
+    const hostname = `${workerName.toLowerCase()}.${subdomain}.workers.dev`;
+
+    // 2. Generate multi-module bundle
     const bundle = generateWebProxyBundle({
-      workerName: cleanWorkerName,
-      proxySecret: cleanSecret,
-      isFirstDeploy: true,
+      workerName: workerName.trim(),
+      proxySecret: proxySecret.trim(),
     });
 
+    // 3. Build multipart/form-data payload
     const formData = new FormData();
     formData.append(
       'metadata',
       new Blob([JSON.stringify(bundle.metadata)], { type: 'application/json' }),
       'metadata.json'
     );
+
     for (const [filename, content] of Object.entries(bundle.files)) {
-      formData.append(filename, new Blob([content], { type: 'application/javascript+module' }), filename);
-    }
-
-    const uploadRes = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/\( {accountId.trim()}/workers/scripts/ \){cleanWorkerName}`,
-      {
-        method: 'PUT',
-        headers: { Authorization: `Bearer ${apiToken.trim()}` },
-        body: formData,
-      }
-    );
-    const uploadData = (await uploadRes.json()) as any;
-    if (!uploadData.success) {
-      const errorMsg =
-        (uploadData.errors || []).map((e: any) => `[${e.code}] ${e.message}`).join(' | ') || 'Upload failed';
-      return res.status(400).json({ success: false, error: `Cloudflare upload: ${errorMsg}` });
-    }
-
-    let subdomain = '';
-    try {
-      const subRes = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${accountId.trim()}/workers/subdomain`,
-        { headers: { Authorization: `Bearer ${apiToken.trim()}` } }
+      formData.append(
+        filename,
+        new Blob([content], { type: 'application/javascript+module' }),
+        filename
       );
-      const subData = (await subRes.json()) as any;
-      if (subData.success && subData.result?.subdomain) subdomain = subData.result.subdomain;
-    } catch {
-      /* non-fatal */
     }
 
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const enableRes = await fetch(
-          `https://api.cloudflare.com/client/v4/accounts/\( {accountId.trim()}/workers/scripts/ \){cleanWorkerName}/subdomain`,
-          {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${apiToken.trim()}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ enabled: true }),
-          }
-        );
-        const enableData = (await enableRes.json()) as any;
-        if (enableData.success) break;
-        const has10063 = enableData.errors?.some((e: any) => e.code === 10063);
-        if (has10063 && attempt < 3) await new Promise((r) => setTimeout(r, 2000));
-      } catch {
+    // 4. Upload script via PUT with retry on Cloudflare error 10063
+    let uploadRes: any = null;
+    let uploadData: any = null;
+    let attempts = 0;
+
+    while (attempts < 3) {
+      attempts++;
+      uploadRes = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName.trim())}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${apiToken.trim()}`,
+          },
+          body: formData,
+        }
+      );
+
+      uploadData = await uploadRes.json() as any;
+
+      if (uploadData.success) {
         break;
       }
+
+      // Check for code 10063 (temporary rate limit or state lock)
+      const is10063 = uploadData.errors?.some((e: any) => e.code === 10063);
+      if (is10063 && attempts < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        continue;
+      }
+      break;
     }
 
-    const hostname = subdomain
-      ? `\( {cleanWorkerName}. \){subdomain}.workers.dev`
-      : `${cleanWorkerName}.workers.dev`;
+    if (!uploadData?.success) {
+      const errMsg = uploadData?.errors?.[0]?.message || 'Failed to upload script to Cloudflare.';
+      return res.status(400).json({ success: false, error: errMsg });
+    }
+
+    // 5. Enable workers.dev subdomain routing
+    await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName.trim())}/subdomain`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiToken.trim()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ enabled: true }),
+      }
+    );
+
+    const tmeLink = `https://t.me/webproxy?server=${encodeURIComponent(hostname)}&secret=${encodeURIComponent(proxySecret.trim())}`;
+    const tgLink = `tg://webproxy?server=${encodeURIComponent(hostname)}&secret=${encodeURIComponent(proxySecret.trim())}`;
 
     return res.json({
       success: true,
       hostname,
-      secret: cleanSecret,
-      tmeLink: `https://t.me/webproxy?server=\( {encodeURIComponent(hostname)}&secret= \){encodeURIComponent(cleanSecret)}`,
-      tgLink: `tg://webproxy?server=\( {encodeURIComponent(hostname)}&secret= \){encodeURIComponent(cleanSecret)}`,
+      secret: proxySecret.trim(),
+      tmeLink,
+      tgLink,
     });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: 'Deploy failure: ' + (err.message || 'internal') });
+    return res.status(500).json({
+      success: false,
+      error: `Deployment error: ${err.message || 'Unknown network error'}`,
+    });
   }
 });
 
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'telo-webproxy-deployer' });
-});
-
+// Setup Vite middleware or static serving
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+  if (!isProduction) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
   }
+
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});

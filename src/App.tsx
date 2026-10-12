@@ -55,7 +55,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiToken: apiToken.trim() }),
       });
-      const data = await res.json();
+      const data: any = await res.json();
       if (data.success) {
         setAccounts(data.accounts || []);
         if (data.accounts?.length > 0 && !accountId) {
@@ -88,7 +88,7 @@ export default function App() {
         }),
       });
 
-      const data = await res.json();
+      const data: any = await res.json();
       if (data.success) {
         setDeployResult({
           hostname: data.hostname,
