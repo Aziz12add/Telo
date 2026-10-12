@@ -40,6 +40,7 @@ export function generateWebProxyBundle(config: WorkerBundleConfig): WorkerBundle
       'index.js': fs.readFileSync(path.join(root, 'index.js'), 'utf-8'),
       'session.js': fs.readFileSync(path.join(root, 'session.js'), 'utf-8'),
       'protocol.js': fs.readFileSync(path.join(root, 'protocol.js'), 'utf-8'),
+      'mtproxy.js': fs.readFileSync(path.join(root, 'mtproxy.js'), 'utf-8'),
     },
   };
 }

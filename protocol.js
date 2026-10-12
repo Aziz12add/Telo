@@ -1,19 +1,22 @@
 // protocol.js
-// Telegram WEB Proxy binary frame codec and crypto engine
+// Official Telegram WEB Proxy v1 Protocol Codec & Cryptographic Capabilities
 
 export const FRAME_TYPES = Object.freeze({
-  HELLO: 0x01,
-  WELCOME: 0x02,
-  OPEN: 0x03,
-  DATA: 0x04,
-  CLOSE: 0x05,
-  WINDOW: 0x06,
-  PING: 0x07,
-  PONG: 0x08,
+  OPEN: 0x01,
+  DATA: 0x02,
+  CLOSE: 0x03,
+  WINDOW: 0x04,
+  PING: 0x05,
+  PONG: 0x06,
+  HELLO: 0x10,
+  WELCOME: 0x11,
+  BYE: 0x1f,
 });
 
 export const MAX_DATA_CHUNK = 64 * 1024; // 64 KiB
 export const CARRIER_HARD_MAX = 2 * 1024 * 1024; // 2 MiB
+export const INITIAL_STREAM_WINDOW = 4 * 1024 * 1024; // 4 MiB
+export const MAX_STREAMS_PER_SESSION = 32;
 
 export class ProtocolError extends Error {
   constructor(message, code = 1002) {
@@ -24,10 +27,7 @@ export class ProtocolError extends Error {
 }
 
 /**
- * Constant-time comparison of two strings or Uint8Array buffers.
- * @param {string|Uint8Array} a
- * @param {string|Uint8Array} b
- * @returns {boolean}
+ * Constant-time comparison to prevent timing attacks.
  */
 export function constantTimeCompare(a, b) {
   if (typeof a === 'string' && typeof b === 'string') {
@@ -50,13 +50,11 @@ export function constantTimeCompare(a, b) {
 }
 
 /**
- * Parses a 32-character hex string or 'dd' prefixed 34-character hex string into 16 bytes.
- * @param {string} secretHex
- * @returns {Uint8Array}
+ * Parses a 32-hex character secret (or 34-hex starting with 'dd') into 16 bytes.
  */
 export function parseSecret(secretHex) {
   if (typeof secretHex !== 'string') {
-    throw new TypeError('Secret must be a hex string');
+    throw new TypeError('Secret must be a string');
   }
   let s = secretHex.trim().toLowerCase();
   if (s.startsWith('dd')) {
@@ -67,15 +65,13 @@ export function parseSecret(secretHex) {
   }
   const out = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {
-    out[i] = parseInt(s.substr(i * 2, 2), 16);
+    out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
   }
   return out;
 }
 
 /**
  * Encodes Uint8Array or ArrayBuffer into unpadded base64url.
- * @param {Uint8Array|ArrayBuffer} buffer
- * @returns {string}
  */
 export function toBase64UrlNoPad(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -90,16 +86,43 @@ export function toBase64UrlNoPad(buffer) {
 }
 
 /**
- * Computes official Telegram Web Proxy bridge capability hash.
+ * Validates and canonicalizes the request hostname.
+ */
+export function canonicalizeHostname(rawHost) {
+  if (!rawHost || typeof rawHost !== 'string') {
+    throw new Error('Invalid host');
+  }
+
+  const clean = rawHost.split(':')[0].trim().toLowerCase();
+  if (!clean || clean.length < 3 || !clean.includes('.')) {
+    throw new Error('Host must contain dot and be at least 3 characters');
+  }
+
+  // Reject raw IPv4 and IPv6
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(clean)) {
+    throw new Error('Direct IP addresses are not permitted');
+  }
+  if (clean.startsWith('[') || clean.includes(':')) {
+    throw new Error('IPv6 addresses are not permitted');
+  }
+
+  try {
+    const url = new URL(`https://${clean}`);
+    return url.hostname;
+  } catch {
+    throw new Error('Invalid URL hostname');
+  }
+}
+
+/**
+ * Computes official Telegram Web Proxy bridge capability hash:
  * context = UTF-8("tdesktop-web-proxy-bridge-v1\n" + hostname)
- * bridge = base64url-nopad(HMAC-SHA256(secretBytes, context))
- * @param {Uint8Array|string} secret
- * @param {string} hostname
- * @returns {Promise<string>}
+ * bridge  = base64url-nopad(HMAC-SHA256(key=secretBytes, message=context))
  */
 export async function computeBridgeCapability(secret, hostname) {
+  const canonicalHost = canonicalizeHostname(hostname);
   const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
-  const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${hostname.trim().toLowerCase()}`);
+  const context = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${canonicalHost}`);
 
   const key = await crypto.subtle.importKey(
     'raw',
@@ -115,23 +138,18 @@ export async function computeBridgeCapability(secret, hostname) {
 
 /**
  * Verifies if the provided bridge capability string matches the expected host and secret.
- * @param {string} providedBridge
- * @param {Uint8Array|string} secret
- * @param {string} hostname
- * @returns {Promise<boolean>}
  */
 export async function verifyBridgeCapability(providedBridge, secret, hostname) {
-  const expected = await computeBridgeCapability(secret, hostname);
-  return constantTimeCompare(providedBridge, expected);
+  try {
+    const expected = await computeBridgeCapability(secret, hostname);
+    return constantTimeCompare(providedBridge.trim(), expected);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Signs a session bootstrap token using HMAC-SHA256.
- * format: <sessionId>.<timestamp>.<base64url-signature>
- * @param {Uint8Array|string} secret
- * @param {string} sessionId
- * @param {number} timestamp
- * @returns {Promise<string>}
+ * Signs a session token for WebSocket authentication.
  */
 export async function signSessionToken(secret, sessionId, timestamp) {
   const secretBytes = typeof secret === 'string' ? parseSecret(secret) : secret;
@@ -151,11 +169,7 @@ export async function signSessionToken(secret, sessionId, timestamp) {
 }
 
 /**
- * Verifies HMAC signed session token with constant-time equality and expiration check.
- * @param {Uint8Array|string} secret
- * @param {string} token
- * @param {number} [maxAgeSeconds=3600]
- * @returns {Promise<{ valid: boolean, sessionId?: string, timestamp?: number }>}
+ * Verifies signed session token.
  */
 export async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
   if (typeof token !== 'string') {
@@ -176,34 +190,26 @@ export async function verifySessionToken(secret, token, maxAgeSeconds = 3600) {
     return { valid: false };
   }
 
-  const expectedToken = await signSessionToken(secret, sessionId, timestamp);
-  const expectedSig = expectedToken.split('.')[2];
+  try {
+    const expectedToken = await signSessionToken(secret, sessionId, timestamp);
+    const expectedSig = expectedToken.split('.')[2];
 
-  if (!constantTimeCompare(signature, expectedSig)) {
+    if (!constantTimeCompare(signature, expectedSig)) {
+      return { valid: false };
+    }
+
+    return { valid: true, sessionId, timestamp };
+  } catch {
     return { valid: false };
   }
-
-  return { valid: true, sessionId, timestamp };
 }
 
 /**
- * Encodes a frame with standard 8-byte header:
- * [1 byte type][2 bytes streamId BE][1 byte flags][4 bytes payloadLen BE][payload]
- *
- * @param {number} type - FRAME_TYPES
- * @param {number} [streamId=0] - 16-bit unsigned integer streamId
- * @param {number} [flags=0] - 8-bit unsigned flags
- * @param {Uint8Array} [payload=new Uint8Array(0)]
- * @returns {Uint8Array}
+ * Official Telegram WEB Proxy v1 Frame Encoder:
+ * Header (8 bytes):
+ * [type: u8 (1B)][stream_id: u24 BE (3B)][payload_length: u32 BE (4B)][payload]
  */
-export function encodeFrame(type, streamId = 0, flags = 0, payload = new Uint8Array(0)) {
-  // Support overload: encodeFrame(type, payload)
-  if (streamId instanceof Uint8Array || (typeof streamId === 'object' && streamId !== null && 'byteLength' in streamId)) {
-    payload = streamId;
-    streamId = 0;
-    flags = 0;
-  }
-
+export function encodeFrame(type, streamId = 0, payload = new Uint8Array(0)) {
   const payloadBytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload || 0);
   const payloadLen = payloadBytes.byteLength;
 
@@ -212,15 +218,21 @@ export function encodeFrame(type, streamId = 0, flags = 0, payload = new Uint8Ar
   }
 
   if (payloadLen > CARRIER_HARD_MAX) {
-    throw new ProtocolError(`Frame payload ${payloadLen} exceeds carrier hard max 2MiB`, 1002);
+    throw new ProtocolError(`Frame payload ${payloadLen} exceeds carrier limit 2MiB`, 1002);
   }
 
   const buffer = new Uint8Array(8 + payloadLen);
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
+  // Byte 0: type (u8)
   view.setUint8(0, type & 0xff);
-  view.setUint16(1, streamId & 0xffff, false);
-  view.setUint8(3, flags & 0xff);
+
+  // Bytes 1..3: stream_id (u24 big-endian)
+  view.setUint8(1, (streamId >>> 16) & 0xff);
+  view.setUint8(2, (streamId >>> 8) & 0xff);
+  view.setUint8(3, streamId & 0xff);
+
+  // Bytes 4..7: payload_length (u32 big-endian)
   view.setUint32(4, payloadLen, false);
 
   if (payloadLen > 0) {
@@ -231,11 +243,7 @@ export function encodeFrame(type, streamId = 0, flags = 0, payload = new Uint8Ar
 }
 
 /**
- * Decodes a single frame from the buffer:
- * Header: [1 byte type][2 bytes streamId BE][1 byte flags][4 bytes payloadLen BE][payload]
- *
- * @param {Uint8Array} buffer
- * @returns {{ frame: { type: number, streamId: number, flags: number, payload: Uint8Array } | null, remainder: Uint8Array }}
+ * Decodes a single frame from the buffer according to the official Telegram WEB Proxy v1 spec.
  */
 export function decodeFrame(buffer) {
   if (!(buffer instanceof Uint8Array)) {
@@ -248,12 +256,11 @@ export function decodeFrame(buffer) {
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const type = view.getUint8(0);
-  const streamId = view.getUint16(1, false);
-  const flags = view.getUint8(3);
+  const streamId = (view.getUint8(1) << 16) | (view.getUint8(2) << 8) | view.getUint8(3);
   const payloadLen = view.getUint32(4, false);
 
   if (payloadLen > CARRIER_HARD_MAX) {
-    throw new ProtocolError(`Payload length ${payloadLen} exceeds carrier hard max 2MiB`, 1002);
+    throw new ProtocolError(`Payload length ${payloadLen} exceeds carrier limit 2MiB`, 1002);
   }
 
   if (buffer.byteLength < 8 + payloadLen) {
@@ -268,16 +275,13 @@ export function decodeFrame(buffer) {
   const remainder = buffer.slice(8 + payloadLen);
 
   return {
-    frame: { type, streamId, flags, payload },
+    frame: { type, streamId, payload },
     remainder,
   };
 }
 
 /**
  * Decodes all complete frames available in the buffer.
- *
- * @param {Uint8Array} buffer
- * @returns {{ frames: Array<{ type: number, streamId: number, flags: number, payload: Uint8Array }>, remainder: Uint8Array }}
  */
 export function decodeFrames(buffer) {
   const frames = [];

@@ -86,7 +86,8 @@ app.post('/api/cloudflare/deploy', async (req: Request, res: Response) => {
       },
     });
     const subData = await subRes.json() as any;
-    const subdomain = subData.result?.subdomain || `${accountId.substring(0, 8)}.workers.dev`;
+    const rawSub = subData.result?.subdomain || accountId.substring(0, 8);
+    const subdomain = String(rawSub).replace(/\.workers\.dev$/i, '');
     const hostname = `${workerName.toLowerCase()}.${subdomain}.workers.dev`;
 
     // 2. Generate multi-module bundle

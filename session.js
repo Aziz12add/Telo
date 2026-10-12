@@ -1,18 +1,23 @@
 // session.js
-// Cloudflare Durable Object ProxySessionDO for Telegram WEB Proxy
-// Transparent MTProto relay to Telegram Data Centers using cloudflare:sockets
+// Cloudflare Durable Object ProxySessionDO for Telegram Official WEB Proxy v1
+// Connects directly to Telegram Data Centers using cloudflare:sockets
 
 import { connect } from 'cloudflare:sockets';
 import {
   FRAME_TYPES,
   MAX_DATA_CHUNK,
+  INITIAL_STREAM_WINDOW,
+  MAX_STREAMS_PER_SESSION,
   encodeFrame,
   decodeFrames,
   verifySessionToken,
+  computeBridgeCapability,
+  constantTimeCompare,
+  canonicalizeHostname,
   ProtocolError,
 } from './protocol.js';
 
-export const TELEGRAM_DC_MAP = Object.freeze({
+export const TELEGRAM_DCS = Object.freeze({
   1: { ip: '149.154.175.50', port: 443 },
   2: { ip: '149.154.167.51', port: 443 },
   3: { ip: '149.154.175.100', port: 443 },
@@ -20,11 +25,9 @@ export const TELEGRAM_DC_MAP = Object.freeze({
   5: { ip: '91.108.56.165', port: 443 },
 });
 
-export const DEFAULT_DC = TELEGRAM_DC_MAP[2];
+export const DEFAULT_DC = TELEGRAM_DCS[2];
 
-const MAX_STREAMS_PER_SESSION = 32;
-const INITIAL_STREAM_WINDOW = 4 * 1024 * 1024; // 4 MiB
-const IDLE_TIMEOUT_MS = 300000; // 5m
+const IDLE_TIMEOUT_MS = 300000; // 5 minutes
 
 class StreamContext {
   constructor(streamId, dcId, abortController) {
@@ -44,10 +47,9 @@ export class ProxySessionDO {
   constructor(ctx, env) {
     this.ctx = ctx;
     this.env = env;
-
     this.ws = null;
     this.rxBuffer = new Uint8Array(0);
-    this.streams = new Map(); // streamId -> StreamContext
+    this.streams = new Map();
     this.tombstones = new Set();
   }
 
@@ -78,14 +80,40 @@ export class ProxySessionDO {
 
     const internalAuth = request.headers.get('X-Internal-Auth');
     if (internalAuth !== 'trusted-worker') {
+      let isAuthorized = false;
+      const subprotocol = request.headers.get('Sec-WebSocket-Protocol');
       const token = url.searchParams.get('token');
-      if (!token) {
-        return new Response('Unauthorized: missing token', { status: 401 });
+
+      if (subprotocol) {
+        const match = subprotocol.match(/tproxy-v1\.([A-Za-z0-9_-]+)/);
+        if (match) {
+          const providedToken = match[1];
+          try {
+            const canonicalHost = canonicalizeHostname(url.hostname);
+            const expectedBridge = await computeBridgeCapability(this.env.PROXY_SECRET, canonicalHost);
+            if (constantTimeCompare(providedToken, expectedBridge)) {
+              isAuthorized = true;
+            }
+          } catch {}
+
+          if (!isAuthorized) {
+            const auth = await verifySessionToken(this.env.PROXY_SECRET, providedToken, 3600);
+            if (auth.valid) {
+              isAuthorized = true;
+            }
+          }
+        }
       }
 
-      const auth = await verifySessionToken(this.env.PROXY_SECRET, token, 3600);
-      if (!auth.valid) {
-        return new Response('Unauthorized: invalid or expired session token', { status: 403 });
+      if (!isAuthorized && token) {
+        const auth = await verifySessionToken(this.env.PROXY_SECRET, token, 3600);
+        if (auth.valid) {
+          isAuthorized = true;
+        }
+      }
+
+      if (!isAuthorized) {
+        return new Response('Unauthorized: invalid or missing proxy token', { status: 403 });
       }
     }
 
@@ -93,17 +121,24 @@ export class ProxySessionDO {
     const pair = new WebSocketPair();
     const [clientSocket, serverSocket] = Object.values(pair);
 
-    // @ts-ignore accept server socket
+    // @ts-ignore Cloudflare accept method
     serverSocket.accept();
     this.ws = serverSocket;
     this.touchIdleTimer();
 
     this.bindCarrierSocket(serverSocket);
 
+    const headers = new Headers();
+    const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
+    if (requestedProtocol?.includes('tproxy-v1')) {
+      headers.set('Sec-WebSocket-Protocol', 'tproxy-v1');
+    }
+
     return new Response(null, {
       status: 101,
       // @ts-ignore webSocket response
       webSocket: clientSocket,
+      headers,
     });
   }
 
@@ -152,16 +187,16 @@ export class ProxySessionDO {
   }
 
   async handleFrame(frame) {
-    const { type, streamId, flags, payload } = frame;
+    const { type, streamId, payload } = frame;
 
     switch (type) {
       case FRAME_TYPES.HELLO: {
-        // Welcome response: 8-byte payload [4-byte initialWindow BE][4-byte maxStreams BE]
+        // Official WELCOME frame: 8-byte payload [4B initialWindow BE][4B maxStreams BE]
         const welcome = new Uint8Array(8);
         const view = new DataView(welcome.buffer);
         view.setUint32(0, INITIAL_STREAM_WINDOW, false);
         view.setUint32(4, MAX_STREAMS_PER_SESSION, false);
-        this.sendFrame(FRAME_TYPES.WELCOME, 0, 0, welcome);
+        this.sendFrame(FRAME_TYPES.WELCOME, 0, welcome);
         break;
       }
 
@@ -199,19 +234,33 @@ export class ProxySessionDO {
         if (stream && !stream.closed && payload.byteLength >= 4) {
           const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
           const credit = view.getUint32(0, false);
-          stream.outboundWindow = Math.min(stream.outboundWindow + credit, INITIAL_STREAM_WINDOW * 2);
+          stream.outboundWindow = Math.min(
+            stream.outboundWindow + credit,
+            INITIAL_STREAM_WINDOW * 2
+          );
         }
         break;
       }
 
       case FRAME_TYPES.PING: {
-        this.sendFrame(FRAME_TYPES.PONG, streamId, flags, payload);
+        this.sendFrame(FRAME_TYPES.PONG, streamId, payload);
         break;
       }
 
       case FRAME_TYPES.CLOSE: {
         const code = payload.byteLength >= 1 ? payload[0] : 0x00;
         this.closeStream(streamId, code);
+        break;
+      }
+
+      case FRAME_TYPES.BYE: {
+        this.closeAllStreams(0x00);
+        if (this.ws) {
+          try {
+            this.ws.close(1000, 'Client requested bye');
+          } catch {}
+          this.ws = null;
+        }
         break;
       }
     }
@@ -222,14 +271,13 @@ export class ProxySessionDO {
     const stream = new StreamContext(streamId, dcId, abortController);
     this.streams.set(streamId, stream);
 
-    const targetDc = TELEGRAM_DC_MAP[dcId] || DEFAULT_DC;
+    const targetDc = TELEGRAM_DCS[dcId] || DEFAULT_DC;
 
     try {
       const dialTimeout = setTimeout(() => {
         abortController.abort();
       }, 10000);
 
-      // Connect transparently to Telegram DC on port 443
       const socket = connect({
         hostname: targetDc.ip,
         port: targetDc.port,
@@ -237,7 +285,9 @@ export class ProxySessionDO {
 
       clearTimeout(dialTimeout);
       if (stream.closed || abortController.signal.aborted) {
-        try { socket.close(); } catch {}
+        try {
+          socket.close();
+        } catch {}
         return;
       }
 
@@ -246,7 +296,7 @@ export class ProxySessionDO {
       stream.reader = socket.readable.getReader();
 
       this.pumpUpstreamToCarrier(stream);
-    } catch (err) {
+    } catch {
       this.closeStream(streamId, 0x01);
     }
   }
@@ -280,7 +330,7 @@ export class ProxySessionDO {
             const chunkSize = Math.min(MAX_DATA_CHUNK, value.byteLength - offset);
             const chunk = value.subarray(offset, offset + chunkSize);
 
-            this.sendFrame(FRAME_TYPES.DATA, stream.streamId, 0, chunk);
+            this.sendFrame(FRAME_TYPES.DATA, stream.streamId, chunk);
             offset += chunkSize;
             stream.outboundWindow -= chunkSize;
 
@@ -291,7 +341,7 @@ export class ProxySessionDO {
         }
       }
     } catch {
-      // Socket ended
+      // Socket finished
     } finally {
       this.closeStream(stream.streamId, 0x00);
     }
@@ -309,18 +359,18 @@ export class ProxySessionDO {
     const payload = new Uint8Array(4);
     const view = new DataView(payload.buffer);
     view.setUint32(0, credit, false);
-    this.sendFrame(FRAME_TYPES.WINDOW, streamId, 0, payload);
+    this.sendFrame(FRAME_TYPES.WINDOW, streamId, payload);
   }
 
   sendStreamClose(streamId, code = 0) {
     const payload = new Uint8Array([code & 0xff]);
-    this.sendFrame(FRAME_TYPES.CLOSE, streamId, 0, payload);
+    this.sendFrame(FRAME_TYPES.CLOSE, streamId, payload);
   }
 
-  sendFrame(type, streamId = 0, flags = 0, payload = new Uint8Array(0)) {
+  sendFrame(type, streamId = 0, payload = new Uint8Array(0)) {
     if (!this.ws) return;
     try {
-      const buffer = encodeFrame(type, streamId, flags, payload);
+      const buffer = encodeFrame(type, streamId, payload);
       this.ws.send(buffer);
     } catch {
       this.closeCarrierProtocolViolation('Carrier write failure', 1002);

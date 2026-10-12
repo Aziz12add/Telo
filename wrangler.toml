@@ -1,0 +1,16 @@
+name = "telo"
+main = "src/worker/index.ts"
+compatibility_date = "2024-11-11"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# PROXY_SECRET should be set via `wrangler secret put PROXY_SECRET` in production
+
+[durable_objects]
+bindings = [
+  { name = "SESSIONS", class_name = "ProxySessionDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProxySessionDO"]
