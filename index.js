@@ -15,16 +15,13 @@ function nonce() {
 }
 
 function decoy() {
-  return new Response(
-    `<!doctype html><meta charset=utf-8><title>OK</title><p>OK</p>`,
-    {
-      status: 200,
-      headers: {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store',
-      },
-    }
-  );
+  return new Response(`<!doctype html><meta charset=utf-8><title>OK</title><p>OK</p>`, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+    },
+  });
 }
 
 function bridgePage(n, host, token, wsUrl, link) {
