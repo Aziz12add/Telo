@@ -10,10 +10,10 @@ import {
   signSessionToken,
   verifySessionToken,
   constantTimeCompare,
-} from './protocol.ts';
-import { ProxySessionDO } from './session.ts';
+} from './protocol';
+import { ProxySessionDO, WebSocketProxy } from "./WebSocketProxy";
 
-export { ProxySessionDO };
+export { ProxySessionDO, WebSocketProxy };
 
 export interface Env {
   PROXY_SECRET: string;

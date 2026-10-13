@@ -1,9 +1,14 @@
-async function dialTelegramSocket(options) {
+// src/worker/session.ts
+// Cloudflare Durable Object ProxySessionDO for Telegram Official WEB Proxy v1
+// Connects directly to Telegram Data Centers using cloudflare:sockets
+
+async function dialTelegramSocket(options: { hostname: string; port: number }) {
   try {
-    const sockets = await import("cloudflare:sockets");
+    // @ts-ignore
+    const sockets = await import('cloudflare:sockets');
     return sockets.connect(options);
   } catch {
-    throw new Error("cloudflare:sockets is only available in Cloudflare Workers runtime");
+    throw new Error('cloudflare:sockets is only available in Cloudflare Workers runtime');
   }
 }
 import {
@@ -14,23 +19,33 @@ import {
   INITIAL_STREAM_WINDOW,
   MAX_STREAMS_PER_SESSION,
   constantTimeCompare,
-  ProtocolError
-} from "./protocol.ts";
-const TELEGRAM_DCS = Object.freeze({
-  1: { ip: "149.154.175.50", port: 443 },
-  2: { ip: "149.154.167.51", port: 443 },
-  3: { ip: "149.154.175.100", port: 443 },
-  4: { ip: "149.154.167.91", port: 443 },
-  5: { ip: "91.108.56.130", port: 443 }
+  ProtocolError,
+  type Frame,
+} from './protocol';
+
+export const TELEGRAM_DCS: Record<number, { ip: string; port: number }> = Object.freeze({
+  1: { ip: '149.154.175.50', port: 443 },
+  2: { ip: '149.154.167.51', port: 443 },
+  3: { ip: '149.154.175.100', port: 443 },
+  4: { ip: '149.154.167.91', port: 443 },
+  5: { ip: '91.108.56.130', port: 443 },
 });
-const DEFAULT_DC = TELEGRAM_DCS[2];
-const IDLE_TIMEOUT_MS = 3e5;
+
+export const DEFAULT_DC = TELEGRAM_DCS[2];
+const IDLE_TIMEOUT_MS = 300000; // 5 minutes
+
 class StreamContext {
-  constructor(streamId, dcId, abortController) {
-    this.socket = null;
-    this.writer = null;
-    this.reader = null;
-    this.closed = false;
+  streamId: number;
+  dcId: number;
+  abortController: AbortController;
+  inboundWindow: number;
+  outboundWindow: number;
+  socket: any | null = null;
+  writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  closed = false;
+
+  constructor(streamId: number, dcId: number, abortController: AbortController) {
     this.streamId = streamId;
     this.dcId = dcId;
     this.abortController = abortController;
@@ -38,73 +53,90 @@ class StreamContext {
     this.outboundWindow = INITIAL_STREAM_WINDOW;
   }
 }
-class ProxySessionDO {
-  constructor(state, env) {
-    this.ws = null;
-    this.streams = /* @__PURE__ */ new Map();
-    this.tombstones = /* @__PURE__ */ new Set();
-    this.rxBuffer = new Uint8Array(0);
-    this.idleTimer = null;
+
+export class ProxySessionDO {
+  state: DurableObjectState;
+  env: any;
+  ws: WebSocket | null = null;
+  streams = new Map<number, StreamContext>();
+  tombstones = new Set<number>();
+  rxBuffer = new Uint8Array(0);
+  idleTimer: any = null;
+
+  constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
   }
-  touchIdleTimer() {
+
+  private touchIdleTimer(): void {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
     }
     this.idleTimer = setTimeout(() => {
-      this.closeCarrierProtocolViolation("Session idle timeout", 1e3);
+      this.closeCarrierProtocolViolation('Session idle timeout', 1000);
     }, IDLE_TIMEOUT_MS);
   }
-  async fetch(request) {
-    const internalAuth = request.headers.get("X-Internal-Auth");
-    if (!internalAuth || !constantTimeCompare(internalAuth, "trusted-worker")) {
-      return new Response("Unauthorized internal call", { status: 403 });
+
+  async fetch(request: Request): Promise<Response> {
+    // Enforce internal routing authentication from Worker edge
+    const internalAuth = request.headers.get('X-Internal-Auth');
+    if (!internalAuth || !constantTimeCompare(internalAuth, 'trusted-worker')) {
+      return new Response('Unauthorized internal call', { status: 403 });
     }
-    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("Expected WebSocket upgrade", { status: 426 });
+
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('Expected WebSocket upgrade', { status: 426 });
     }
+
+    // @ts-ignore WebSocketPair is a Cloudflare Workers global
     const pair = new WebSocketPair();
     const clientSocket = pair[0];
     const serverSocket = pair[1];
+
     serverSocket.accept();
     this.ws = serverSocket;
     this.touchIdleTimer();
     this.bindCarrierSocket(serverSocket);
+
     const headers = new Headers();
-    const requestedProtocol = request.headers.get("Sec-WebSocket-Protocol");
+    const requestedProtocol = request.headers.get('Sec-WebSocket-Protocol');
     if (requestedProtocol) {
-      const parts = requestedProtocol.split(",").map((p) => p.trim());
-      const matched = parts.find((p) => p.startsWith("tproxy-v1"));
+      const parts = requestedProtocol.split(',').map((p) => p.trim());
+      const matched = parts.find((p) => p.startsWith('tproxy-v1'));
       if (matched) {
-        headers.set("Sec-WebSocket-Protocol", matched);
+        headers.set('Sec-WebSocket-Protocol', matched);
       }
     }
+
     return new Response(null, {
       status: 101,
       // @ts-ignore webSocket response in Cloudflare Workers
       webSocket: clientSocket,
-      headers
+      headers,
     });
   }
-  bindCarrierSocket(ws) {
-    ws.addEventListener("message", async (event) => {
+
+  private bindCarrierSocket(ws: WebSocket): void {
+    ws.addEventListener('message', async (event: MessageEvent) => {
       this.touchIdleTimer();
       try {
-        let chunk;
-        if (typeof event.data === "string") {
+        let chunk: Uint8Array;
+        if (typeof event.data === 'string') {
           chunk = new TextEncoder().encode(event.data);
         } else if (event.data instanceof ArrayBuffer) {
           chunk = new Uint8Array(event.data);
         } else {
           chunk = new Uint8Array(await event.data.arrayBuffer());
         }
+
         const next = new Uint8Array(this.rxBuffer.byteLength + chunk.byteLength);
         next.set(this.rxBuffer, 0);
         next.set(chunk, this.rxBuffer.byteLength);
         this.rxBuffer = next;
+
         const { frames, remainder } = decodeFrames(this.rxBuffer);
         this.rxBuffer = remainder;
+
         for (const frame of frames) {
           await this.handleFrame(frame);
         }
@@ -112,23 +144,28 @@ class ProxySessionDO {
         if (err instanceof ProtocolError) {
           this.closeCarrierProtocolViolation(err.message, err.code || 1002);
         } else {
-          this.closeCarrierProtocolViolation("Frame decode violation", 1002);
+          this.closeCarrierProtocolViolation('Frame decode violation', 1002);
         }
       }
     });
-    ws.addEventListener("close", () => {
-      this.closeAllStreams(0);
+
+    ws.addEventListener('close', () => {
+      this.closeAllStreams(0x00);
       this.ws = null;
     });
-    ws.addEventListener("error", () => {
-      this.closeAllStreams(1);
+
+    ws.addEventListener('error', () => {
+      this.closeAllStreams(0x01);
       this.ws = null;
     });
   }
-  async handleFrame(frame) {
+
+  private async handleFrame(frame: Frame): Promise<void> {
     const { type, streamId, payload } = frame;
+
     switch (type) {
       case FRAME_TYPES.HELLO: {
+        // Official WELCOME frame: 8-byte payload [4B initialWindow BE][4B maxStreams BE]
         const welcome = new Uint8Array(8);
         const view = new DataView(welcome.buffer);
         view.setUint32(0, INITIAL_STREAM_WINDOW, false);
@@ -136,34 +173,43 @@ class ProxySessionDO {
         this.sendFrame(FRAME_TYPES.WELCOME, 0, welcome);
         break;
       }
+
       case FRAME_TYPES.OPEN: {
+        // Stream ID 0 is reserved for connection control
         if (streamId === 0) {
-          this.sendStreamClose(0, 1);
+          this.sendStreamClose(0, 0x01);
           return;
         }
+
         let targetDcId = 2;
-        let explicitTarget = null;
+        let explicitTarget: { ip: string; port: number } | null = null;
+
         if (payload.byteLength === 1) {
           targetDcId = payload[0];
         } else if (payload.byteLength === 2) {
           const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
           targetDcId = Math.abs(view.getInt16(0, false));
         } else if (payload.byteLength >= 6) {
+          // Explicit IPv4 + port: 4 bytes IP, 2 bytes port BE
           const ip = `${payload[0]}.${payload[1]}.${payload[2]}.${payload[3]}`;
           const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
           const port = view.getUint16(4, false);
           explicitTarget = { ip, port: port || 443 };
         }
+
         if (this.tombstones.has(streamId) || this.streams.has(streamId)) {
           return;
         }
+
         if (this.streams.size >= MAX_STREAMS_PER_SESSION) {
-          this.sendStreamClose(streamId, 3);
+          this.sendStreamClose(streamId, 0x03);
           return;
         }
+
         await this.openDcStream(streamId, targetDcId, explicitTarget);
         break;
       }
+
       case FRAME_TYPES.DATA: {
         const stream = this.streams.get(streamId);
         if (!stream || stream.closed) {
@@ -172,6 +218,7 @@ class ProxySessionDO {
         await this.forwardDataUpstream(stream, payload);
         break;
       }
+
       case FRAME_TYPES.WINDOW: {
         const stream = this.streams.get(streamId);
         if (stream && !stream.closed && payload.byteLength >= 4) {
@@ -184,58 +231,73 @@ class ProxySessionDO {
         }
         break;
       }
+
       case FRAME_TYPES.PING: {
         this.sendFrame(FRAME_TYPES.PONG, streamId, payload);
         break;
       }
+
       case FRAME_TYPES.CLOSE: {
-        const code = payload.byteLength >= 1 ? payload[0] : 0;
+        const code = payload.byteLength >= 1 ? payload[0] : 0x00;
         this.closeStream(streamId, code);
         break;
       }
+
       case FRAME_TYPES.BYE: {
-        this.closeAllStreams(0);
+        this.closeAllStreams(0x00);
         if (this.ws) {
           try {
-            this.ws.close(1e3, "Client requested bye");
-          } catch {
-          }
+            this.ws.close(1000, 'Client requested bye');
+          } catch {}
           this.ws = null;
         }
         break;
       }
     }
   }
-  async openDcStream(streamId, dcId, explicitTarget = null) {
+
+  private async openDcStream(
+    streamId: number,
+    dcId: number,
+    explicitTarget: { ip: string; port: number } | null = null
+  ): Promise<void> {
     const abortController = new AbortController();
     const stream = new StreamContext(streamId, dcId, abortController);
     this.streams.set(streamId, stream);
+
     const targetDc = explicitTarget || TELEGRAM_DCS[dcId] || DEFAULT_DC;
+
     try {
       const dialTimeout = setTimeout(() => {
         abortController.abort();
-      }, 1e4);
+      }, 10000);
+
+      // Connect transparently to Telegram Data Center on port 443
       const socket = await dialTelegramSocket({
         hostname: targetDc.ip,
-        port: targetDc.port
+        port: targetDc.port,
       });
+
       clearTimeout(dialTimeout);
+
       if (stream.closed || abortController.signal.aborted) {
         try {
           socket.close();
-        } catch {
-        }
+        } catch {}
         return;
       }
+
       stream.socket = socket;
       stream.writer = socket.writable.getWriter();
       stream.reader = socket.readable.getReader();
+
       this.pumpUpstreamToCarrier(stream);
     } catch {
-      this.closeStream(streamId, 1);
+      this.closeStream(streamId, 0x01);
     }
   }
-  async forwardDataUpstream(stream, data) {
+
+  private async forwardDataUpstream(stream: StreamContext, data: Uint8Array): Promise<void> {
     if (stream.closed || !stream.writer || data.byteLength === 0) return;
     try {
       await stream.writer.write(data);
@@ -246,10 +308,11 @@ class ProxySessionDO {
         this.sendStreamWindow(stream.streamId, credit);
       }
     } catch {
-      this.closeStream(stream.streamId, 2);
+      this.closeStream(stream.streamId, 0x02);
     }
   }
-  async pumpUpstreamToCarrier(stream) {
+
+  private async pumpUpstreamToCarrier(stream: StreamContext): Promise<void> {
     try {
       while (!stream.closed && stream.reader) {
         const { value, done } = await stream.reader.read();
@@ -262,6 +325,7 @@ class ProxySessionDO {
             this.sendFrame(FRAME_TYPES.DATA, stream.streamId, chunk);
             offset += chunkSize;
             stream.outboundWindow -= chunkSize;
+
             if (stream.outboundWindow <= 0) {
               await this.waitForStreamCredit(stream);
             }
@@ -269,69 +333,77 @@ class ProxySessionDO {
         }
       }
     } catch {
+      // Upstream socket finished or broke
     } finally {
-      this.closeStream(stream.streamId, 0);
+      this.closeStream(stream.streamId, 0x00);
     }
   }
-  async waitForStreamCredit(stream) {
+
+  private async waitForStreamCredit(stream: StreamContext): Promise<void> {
     let waited = 0;
     while (stream.outboundWindow <= 0 && !stream.closed && waited < 100) {
       await new Promise((r) => setTimeout(r, 20));
       waited++;
     }
   }
-  sendStreamWindow(streamId, credit) {
+
+  private sendStreamWindow(streamId: number, credit: number): void {
     const payload = new Uint8Array(4);
     const view = new DataView(payload.buffer);
     view.setUint32(0, credit, false);
     this.sendFrame(FRAME_TYPES.WINDOW, streamId, payload);
   }
-  sendStreamClose(streamId, code = 0) {
-    const payload = new Uint8Array([code & 255]);
+
+  private sendStreamClose(streamId: number, code = 0): void {
+    const payload = new Uint8Array([code & 0xff]);
     this.sendFrame(FRAME_TYPES.CLOSE, streamId, payload);
   }
-  sendFrame(type, streamId = 0, payload = new Uint8Array(0)) {
+
+  private sendFrame(type: number, streamId = 0, payload = new Uint8Array(0)): void {
     if (!this.ws) return;
     try {
       const buffer = encodeFrame(type, streamId, payload);
       this.ws.send(buffer);
     } catch {
-      this.closeCarrierProtocolViolation("Carrier write failure", 1002);
+      this.closeCarrierProtocolViolation('Carrier write failure', 1002);
     }
   }
-  closeStream(streamId, code = 0) {
+
+  private closeStream(streamId: number, code = 0): void {
     const stream = this.streams.get(streamId);
     if (!stream) return;
     stream.closed = true;
     stream.abortController.abort();
     this.streams.delete(streamId);
     this.tombstones.add(streamId);
+
     try {
       if (stream.writer) stream.writer.close();
       if (stream.reader) stream.reader.cancel();
       if (stream.socket) stream.socket.close();
-    } catch {
-    }
+    } catch {}
+
     this.sendStreamClose(streamId, code);
   }
-  closeAllStreams(code = 0) {
+
+  private closeAllStreams(code = 0): void {
     for (const streamId of Array.from(this.streams.keys())) {
       this.closeStream(streamId, code);
     }
   }
-  closeCarrierProtocolViolation(reason, code = 1002) {
-    this.closeAllStreams(1);
+
+  private closeCarrierProtocolViolation(reason: string, code = 1002): void {
+    this.closeAllStreams(0x01);
     if (this.ws) {
       try {
         this.ws.close(code, reason);
-      } catch {
-      }
+      } catch {}
       this.ws = null;
     }
   }
 }
-export {
-  DEFAULT_DC,
-  ProxySessionDO,
-  TELEGRAM_DCS
-};
+
+
+// Export canonical WebSocketProxy alias
+export const WebSocketProxy = ProxySessionDO;
+export type WebSocketProxy = ProxySessionDO;
