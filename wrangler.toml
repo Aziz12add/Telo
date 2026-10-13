@@ -1,17 +1,15 @@
-name = "telo"
+name = "telo-telegram-proxy"
 main = "src/index.ts"
-compatibility_date = "2024-11-11"
+compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-[vars]
-# PROXY_SECRET should be set via `wrangler secret put PROXY_SECRET` in production
-# Format: 32 hex characters
-
-[durable_objects]
-bindings = [
-  { name = "SESSIONS", class_name = "ProxySessionDO" }
-]
+[[durable_objects.bindings]]
+name = "WEBSOCKET_PROXY"
+class_name = "WebSocketProxy"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ProxySessionDO"]
+new_sqlite_classes = ["WebSocketProxy"]
+
+[observability]
+enabled = true
