@@ -1,6 +1,6 @@
 // ============================================================
-// Telegram WEB Proxy v1 – Durable Object Session Handler
-// Bridges WebSocket (client) ↔ TCP (Telegram DC)
+// Telegram WEB Proxy v1 — Durable Object Session Handler
+// Bridges WebSocket (client) <-> TCP (Telegram DC)
 // ============================================================
 
 import { connect } from 'cloudflare:sockets';
@@ -11,18 +11,30 @@ import {
   type ParsedFrame,
 } from './protocol';
 
+// Socket type derived from connect() return type.
 type Socket = ReturnType<typeof connect>;
 
-// ⚠️ Must match NONCE_LEN in protocol.ts
+// ---- Protocol constants ----
+// Must match NONCE_LEN in protocol.ts
 const EXPECTED_NONCE_LEN = 16;
 
-const INITIAL_WINDOW = 1 << 20;          // 1 MiB
-const MAX_STREAMS    = 8;                // ← BUG #3: cap concurrent streams
-const PING_TIMEOUT_MS = 30_000;          // ← BUG #4: half-open detection
-const MAX_RECV_BUF   = 4 << 20;          // 4 MiB safety valve for recvBuffer
+// Flow-control defaults, aligned with the official spec.
+const INITIAL_WINDOW = 4 << 20;   // 4 MiB per stream
+const MAX_STREAMS    = 32;         // max concurrent streams per session
+
+// Safety valve for the inbound accumulation buffer.
+const MAX_RECV_BUF   = 4 << 20;    // 4 MiB
+
+// ---- Protocol error codes (CLOSE payload) ----
+const ERR_BAD_HELLO       = 0x01;
+const ERR_WINDOW_EXCEEDED = 0x02;
+const ERR_TCP_WRITE       = 0x03;
+const ERR_TOO_MANY_STREAMS= 0x04;
+const ERR_UNKNOWN_DC      = 0x05;
+const ERR_TCP_CONNECT     = 0x06;
 
 interface Env {
-  // Future bindings (analytics, KV, etc.)
+  // Placeholder for future bindings (analytics, KV, etc.)
 }
 
 interface Stream {
@@ -30,20 +42,20 @@ interface Stream {
   writer: WritableStreamDefaultWriter<Uint8Array>;
   reader: ReadableStreamDefaultReader<Uint8Array>;
   windowSize: number;
-  lastPingAt: number;                    // ← BUG #4
+  openedAt: number;
 }
 
 export class WebSocketProxy implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
 
+  // ---- Per-connection state ----
   private ws: WebSocket | null = null;
   private secret: Uint8Array | null = null;
   private handshakeDone = false;
   private streams = new Map<number, Stream>();
   private recvBuffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
   private alive = false;
-  private pingTimer: ReturnType<typeof setInterval> | null = null; // ← BUG #4
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -51,20 +63,21 @@ export class WebSocketProxy implements DurableObject {
   }
 
   // ============================================================
-  // Entry point – WebSocket upgrade
+  // Entry point: WebSocket upgrade
   // ============================================================
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
-    // BUG #9 (defensive – Workers runtime also validates)
     if (!request.headers.get('Sec-WebSocket-Key')) {
       return new Response('Missing Sec-WebSocket-Key', { status: 400 });
     }
 
     const url = new URL(request.url);
     const secretHex = url.searchParams.get('secret');
-    if (!secretHex) return new Response('Missing secret', { status: 400 });
+    if (!secretHex) {
+      return new Response('Missing secret', { status: 400 });
+    }
 
     let secret: Uint8Array;
     try {
@@ -73,9 +86,9 @@ export class WebSocketProxy implements DurableObject {
       return new Response('Invalid secret', { status: 400 });
     }
 
-    // Tear down any previous session
+    // Tear down any previous session cleanly.
     if (this.alive) {
-      await this.shutdown('replaced');
+      await this.shutdown('replaced-by-new-session');
     }
 
     this.secret        = secret;
@@ -91,7 +104,14 @@ export class WebSocketProxy implements DurableObject {
     this.alive = true;
 
     server.addEventListener('message', (ev: MessageEvent) => {
-      this.onClientMessage(ev.data as ArrayBuffer).catch((err) => {
+      // Cloudflare delivers either ArrayBuffer (binary) or string (text).
+      // We only expect binary frames.
+      const data = ev.data;
+      const buf = typeof data === 'string'
+        ? new TextEncoder().encode(data).buffer
+        : (data as ArrayBuffer);
+
+      this.onClientMessage(buf).catch((err) => {
         console.error('[ws-msg]', err);
         this.shutdown('client-error').catch(() => {});
       });
@@ -105,49 +125,18 @@ export class WebSocketProxy implements DurableObject {
       this.shutdown('ws-error').catch(() => {});
     });
 
-    // BUG #4: start the PING watchdog
-    this.startPingWatchdog();
-
     return new Response(null, { status: 101, webSocket: client });
   }
 
   // ============================================================
-  // PING watchdog – close streams / session if the peer goes silent
-  // ============================================================
-  private startPingWatchdog(): void {
-    this.stopPingWatchdog();
-    this.pingTimer = setInterval(() => {
-      if (!this.alive) return;
-      const now = Date.now();
-      for (const [sid, s] of this.streams) {
-        if (now - s.lastPingAt > PING_TIMEOUT_MS) {
-          console.warn(`[watchdog] stream ${sid} timed out`);
-          this.closeStream(sid, 0xDEAD).catch(() => {});
-        }
-      }
-      // If WS itself is dead but we haven't noticed, force shutdown
-      if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
-        this.shutdown('ws-stale').catch(() => {});
-      }
-    }, PING_TIMEOUT_MS / 2);
-  }
-
-  private stopPingWatchdog(): void {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
-  }
-
-  // ============================================================
-  // Inbound buffering & frame dispatch
+  // Inbound buffering and frame dispatch
   // ============================================================
   private async onClientMessage(data: ArrayBuffer): Promise<void> {
     const bytes = new Uint8Array(data);
     this.recvBuffer = concatU8(this.recvBuffer, bytes);
 
-    // Safety: if the buffer grows past the cap, something is wrong
     if (this.recvBuffer.length > MAX_RECV_BUF) {
+      console.error('[recv] buffer overflow');
       await this.shutdown('recv-buffer-overflow');
       return;
     }
@@ -164,9 +153,9 @@ export class WebSocketProxy implements DurableObject {
 
       if (!parsed) break;
 
-      // BUG #1 FIX: guard against zero-progress
+      // Guard against zero-progress loops.
       if (parsed.consumed === 0) {
-        console.error('[parse] zero-length frame – aborting');
+        console.error('[parse] zero-length frame');
         await this.shutdown('zero-length-frame');
         return;
       }
@@ -182,18 +171,17 @@ export class WebSocketProxy implements DurableObject {
   private async handleFrame(frame: ParsedFrame): Promise<void> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // ---- Pre-handshake ----
+    // ---- Pre-handshake: HELLO only ----
     if (!this.handshakeDone) {
       if (frame.type !== FrameType.HELLO) {
-        // BUG #7 FIX: send a protocol CLOSE before the WS-level close
-        this.sendIfOpen(buildClose(0, 0x01));  // 0x01 = "bad hello"
+        this.sendIfOpen(buildClose(0, ERR_BAD_HELLO));
         throw new Error('Expected HELLO first');
       }
 
       const nonce = frame.nonce;
       if (!nonce || nonce.length !== EXPECTED_NONCE_LEN) {
-        this.sendIfOpen(buildClose(0, 0x01));
-        throw new Error(`Bad nonce length: ${nonce?.length}`);
+        this.sendIfOpen(buildClose(0, ERR_BAD_HELLO));
+        throw new Error(`Bad HELLO nonce length: ${nonce?.length}`);
       }
 
       const welcome = await buildWelcome(nonce, this.secret!);
@@ -204,11 +192,9 @@ export class WebSocketProxy implements DurableObject {
 
     // ---- Post-handshake dispatch ----
     switch (frame.type) {
-
       case FrameType.OPEN: {
-        // BUG #3 FIX: enforce max streams
         if (this.streams.size >= MAX_STREAMS) {
-          this.sendIfOpen(buildClose(frame.streamId!, 0x04)); // "too many streams"
+          this.sendIfOpen(buildClose(frame.streamId!, ERR_TOO_MANY_STREAMS));
           break;
         }
         await this.openStream(frame.streamId!, frame.dcId!);
@@ -217,13 +203,13 @@ export class WebSocketProxy implements DurableObject {
 
       case FrameType.DATA: {
         const sid = frame.streamId!;
-        const s   = this.streams.get(sid);
+        const s = this.streams.get(sid);
         if (!s) break;
 
         const payload = dataPayload(frame);
 
         if (payload.length > s.windowSize) {
-          await this.closeStream(sid, 0x02); // "window exceeded"
+          await this.closeStream(sid, ERR_WINDOW_EXCEEDED);
           break;
         }
         s.windowSize -= payload.length;
@@ -232,27 +218,24 @@ export class WebSocketProxy implements DurableObject {
           await s.writer.write(payload);
         } catch (err) {
           console.error('[tcp-w]', sid, err);
-          await this.closeStream(sid, 0x03);
+          await this.closeStream(sid, ERR_TCP_WRITE);
         }
         break;
       }
 
       case FrameType.CLOSE:
-        await this.closeStream(frame.streamId!, 0x00);
+        await this.closeStream(frame.streamId!, 0);
         break;
 
-      case FrameType.PING: {
-        // BUG #6 FIX: guard + update watchdog timestamp
-        for (const s of this.streams.values()) s.lastPingAt = Date.now();
+      case FrameType.PING:
         this.sendIfOpen(buildPong());
         break;
-      }
 
       case FrameType.WINDOW: {
-        // BUG #5 FIX: actually apply the window update
-        const sid  = frame.streamId!;
-        const win  = (frame as any).windowSize as number; // adjust to protocol type
-        const s    = this.streams.get(sid);
+        // Peer granted us additional send credit for this stream.
+        const sid = frame.streamId!;
+        const win = frame.windowSize;
+        const s = this.streams.get(sid);
         if (s && typeof win === 'number' && win >= 0) {
           s.windowSize += win;
         }
@@ -262,6 +245,7 @@ export class WebSocketProxy implements DurableObject {
       case FrameType.PONG:
       case FrameType.WELCOME:
       default:
+        // Silently ignore unexpected frames.
         break;
     }
   }
@@ -272,7 +256,7 @@ export class WebSocketProxy implements DurableObject {
   private async openStream(streamId: number, dcId: number): Promise<void> {
     const addr = DC_ADDRESSES[dcId];
     if (!addr) {
-      this.sendIfOpen(buildClose(streamId, 0x05)); // unknown DC
+      this.sendIfOpen(buildClose(streamId, ERR_UNKNOWN_DC));
       return;
     }
 
@@ -281,7 +265,7 @@ export class WebSocketProxy implements DurableObject {
       socket = connect({ hostname: addr, port: DC_PORT });
     } catch (err) {
       console.error('[tcp-c]', streamId, err);
-      this.sendIfOpen(buildClose(streamId, 0x06));
+      this.sendIfOpen(buildClose(streamId, ERR_TCP_CONNECT));
       return;
     }
 
@@ -293,12 +277,12 @@ export class WebSocketProxy implements DurableObject {
       writer,
       reader,
       windowSize: INITIAL_WINDOW,
-      lastPingAt: Date.now(),
+      openedAt: Date.now(),
     };
     this.streams.set(streamId, stream);
-    console.log(`[stream] opened #${streamId} → ${addr}:${DC_PORT}`);
+    console.log(`[stream-open] #${streamId} -> ${addr}:${DC_PORT}`);
 
-    // TCP → WS read loop
+    // ---- TCP -> WebSocket read loop ----
     (async () => {
       try {
         while (true) {
@@ -311,14 +295,12 @@ export class WebSocketProxy implements DurableObject {
       } catch (err) {
         console.error('[tcp-r]', streamId, err);
       } finally {
-        // Only clean up if we're still the owner of this slot
         if (this.streams.get(streamId) === stream) {
           this.streams.delete(streamId);
-          this.sendIfOpen(buildClose(streamId, 0x00));
-          console.log(`[stream] closed #${streamId}`);
+          this.sendIfOpen(buildClose(streamId, 0));
+          console.log(`[stream-close] #${streamId}`);
         }
-        // BUG #2 FIX: close the writable side so the remote gets a FIN
-        try { stream.writer.close(); } catch {}
+        try { await writer.close(); } catch {}
         try { reader.releaseLock(); } catch {}
       }
     })();
@@ -333,26 +315,22 @@ export class WebSocketProxy implements DurableObject {
     this.streams.delete(streamId);
 
     try { await s.writer.close(); } catch {}
-    try { await s.reader.cancel();  } catch {}
-    try { s.reader.releaseLock();  } catch {}
+    try { await s.reader.cancel(); } catch {}
 
     this.sendIfOpen(buildClose(streamId, code));
   }
 
   // ============================================================
-  // Full shutdown
+  // Full shutdown (WebSocket + all streams)
   // ============================================================
   private async shutdown(reason: string): Promise<void> {
     if (!this.alive) return;
     this.alive = false;
     console.log(`[shutdown] ${reason}`);
 
-    this.stopPingWatchdog();
-
     for (const [, s] of this.streams) {
       try { await s.writer.close(); } catch {}
-      try { await s.reader.cancel();  } catch {}
-      try { s.reader.releaseLock();  } catch {}
+      try { await s.reader.cancel(); } catch {}
     }
     this.streams.clear();
 
@@ -366,7 +344,7 @@ export class WebSocketProxy implements DurableObject {
   }
 
   // ============================================================
-  // Helper
+  // Helper: send only if the WebSocket is still open
   // ============================================================
   private sendIfOpen(data: Uint8Array | ArrayBuffer): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -376,11 +354,10 @@ export class WebSocketProxy implements DurableObject {
 }
 
 // ============================================================
-// concatU8 – O(n) append, returns a fresh ArrayBuffer-backed view
+// Utility: allocate a fresh Uint8Array with both parts appended.
+// Always returns a new buffer — never aliases the inputs.
 // ============================================================
 function concatU8(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
-  if (a.length === 0) return b as Uint8Array<ArrayBuffer>;
-  if (b.length === 0) return a as Uint8Array<ArrayBuffer>;
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
