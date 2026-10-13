@@ -1,20 +1,17 @@
 {
-  "name": "telo",
+  "name": "telo-telegram-proxy",
   "version": "1.0.0",
-  "description": "Telegram Official WEB Proxy v1 on Cloudflare Workers",
+  "private": true,
   "type": "module",
-  "main": "src/index.ts",
   "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js",
-    "build": "esbuild src/index.ts --bundle --format=esm --target=es2022 --external:cloudflare:sockets --outfile=dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261012.1",
-    "@types/node": "^22.14.0",
-    "esbuild": "^0.25.0",
-    "typescript": "~5.8.2"
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.6.2",
+    "wrangler": "^3.78.0"
   }
 }
