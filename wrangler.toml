@@ -1,7 +1,11 @@
 name = "telo-telegram-proxy"
 main = "src/index.ts"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2026-10-01"   # بعد از به‌روزرسانی wrangler تنظیم شود
+workers_dev = false                 # اگر از دامنه‌ی خودت استفاده می‌کنی
+
+routes = [
+  { pattern = "proxy.example.com", custom_domain = true }
+]
 
 [[durable_objects.bindings]]
 name = "WEBSOCKET_PROXY"
