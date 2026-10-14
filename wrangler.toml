@@ -1,7 +1,7 @@
 name = "telo-telegram-proxy"
 main = "src/index.ts"
-compatibility_date = "2026-10-01"   # بعد از به‌روزرسانی wrangler تنظیم شود
-workers_dev = false                 # اگر از دامنه‌ی خودت استفاده می‌کنی
+compatibility_date = "2026-10-01" 
+workers_dev = true                 
 
 routes = [
   { pattern = "proxy.example.com", custom_domain = true }
