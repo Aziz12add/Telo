@@ -1,365 +1,367 @@
 // ============================================================
-// Telegram WEB Proxy v1 — Durable Object Session Handler
-// Bridges WebSocket (client) <-> TCP (Telegram DC)
+// Telegram WEB proxy v1 - one relay session (Durable Object)
+//
+//   app --(WEB proxy frames over one WebSocket)--> this DO
+//       OPEN  -> new logical stream
+//       DATA  -> MTProxy-obfuscated bytes: first 64 bytes = init packet
+//                (decrypted with the secret to learn the DC), then transcoded
+//                to a plain obfuscated2 connection to that Telegram DC
+//
+// Flow control follows PROTOCOL.md: 4 MiB credit per stream and direction,
+// WINDOW returned only after bytes reached the DC socket.
 // ============================================================
-
 import { connect } from 'cloudflare:sockets';
 import {
-  FrameType, parseFrame, buildWelcome, buildData,
-  buildClose, buildPong, dataPayload, decodeSecret,
-  DC_ADDRESSES, DC_PORT,
-  type ParsedFrame,
+  FrameType, INITIAL_WINDOW, MAX_DATA_CHUNK,
+  parseBatch, readWindowDelta, buildData, buildClose, buildWindow,
+  decodeSecret, concat,
+  type Frame,
 } from './protocol';
+import { accept, initiate, mtproxySecret, type CtrStream } from './obfuscated2';
+import { DC_ADDRESSES, DC_PORT, resolveDc } from './dc';
 
-// Socket type derived from connect() return type.
 type Socket = ReturnType<typeof connect>;
 
-// ---- Protocol constants ----
-// Must match NONCE_LEN in protocol.ts
-const EXPECTED_NONCE_LEN = 16;
-
-// Flow-control defaults, aligned with the official spec.
-const INITIAL_WINDOW = 4 << 20;   // 4 MiB per stream
-const MAX_STREAMS    = 32;         // max concurrent streams per session
-
-// Safety valve for the inbound accumulation buffer.
-const MAX_RECV_BUF   = 4 << 20;    // 4 MiB
-
-// ---- Protocol error codes (CLOSE payload) ----
-const ERR_BAD_HELLO       = 0x01;
-const ERR_WINDOW_EXCEEDED = 0x02;
-const ERR_TCP_WRITE       = 0x03;
-const ERR_TOO_MANY_STREAMS= 0x04;
-const ERR_UNKNOWN_DC      = 0x05;
-const ERR_TCP_CONNECT     = 0x06;
-
 interface Env {
-  // Placeholder for future bindings (analytics, KV, etc.)
+  PROXY_SECRET: string;
 }
 
-interface Stream {
-  socket: Socket;
-  writer: WritableStreamDefaultWriter<Uint8Array>;
-  reader: ReadableStreamDefaultReader<Uint8Array>;
-  windowSize: number;
-  openedAt: number;
+const MAX_STREAMS = 32;          // live streams per session
+const MAX_TOMBSTONES = 4096;     // remembered closed ids (never reusable)
+const CONNECT_TIMEOUT_MS = 10_000;
+const INIT_LEN = 64;
+
+interface StreamState {
+  id: number;
+  closed: boolean;
+  connected: boolean;
+  hs: Uint8Array[];              // bytes buffered until the 64-byte init is complete
+  hsLen: number;
+  recvCredit: number;            // how much the client may still send us
+  sendCredit: number;            // how much we may still send the client
+  creditWake: (() => void) | null;
+  uplink: Promise<void>;         // serializes processing of this stream's DATA
+  socket: Socket | null;
+  writer: WritableStreamDefaultWriter<Uint8Array> | null;
+  fromClient: CtrStream | null;  // decrypt client -> relay
+  toClient: CtrStream | null;    // encrypt relay -> client
+  dcEnc: CtrStream | null;       // encrypt relay -> DC
+  dcDec: CtrStream | null;       // decrypt DC -> relay
 }
+
+const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+
+const pickSubprotocol = (header: string | null): string | null => {
+  if (!header) return null;
+  for (const part of header.split(',')) {
+    const p = part.trim();
+    if (p.startsWith('tproxy-v1.')) return p;
+  }
+  return null;
+};
 
 export class WebSocketProxy implements DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
-
-  // ---- Per-connection state ----
+  private mtSecret: Uint8Array;
   private ws: WebSocket | null = null;
-  private secret: Uint8Array | null = null;
-  private handshakeDone = false;
-  private streams = new Map<number, Stream>();
-  private recvBuffer: Uint8Array<ArrayBuffer> = new Uint8Array(0);
-  private alive = false;
+  private dead = false;
+  private streams = new Map<number, StreamState>();
+  private tombstones = new Set<number>();
 
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env   = env;
+  constructor(_state: DurableObjectState, env: Env) {
+    this.mtSecret = mtproxySecret(decodeSecret(env.PROXY_SECRET));
   }
 
-  // ============================================================
-  // Entry point: WebSocket upgrade
-  // ============================================================
+  // The Worker has already authenticated the session token before routing here.
   async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+
+    if (path === '/close') {
+      this.shutdown(1000, 'session deleted');
+      return new Response(null, { status: 204 });
+    }
+
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket', { status: 426 });
     }
-    if (!request.headers.get('Sec-WebSocket-Key')) {
-      return new Response('Missing Sec-WebSocket-Key', { status: 400 });
-    }
+    // One multiplexed WebSocket per session; a dead session is never resumed.
+    if (this.dead || this.ws) return new Response('Session unavailable', { status: 409 });
 
-    const url = new URL(request.url);
-    const secretHex = url.searchParams.get('secret');
-    if (!secretHex) {
-      return new Response('Missing secret', { status: 400 });
-    }
+    const proto = pickSubprotocol(request.headers.get('Sec-WebSocket-Protocol'));
+    if (!proto) return new Response('Bad subprotocol', { status: 400 });
 
-    let secret: Uint8Array;
-    try {
-      secret = decodeSecret(secretHex);
-    } catch {
-      return new Response('Invalid secret', { status: 400 });
-    }
-
-    // Tear down any previous session cleanly.
-    if (this.alive) {
-      await this.shutdown('replaced-by-new-session');
-    }
-
-    this.secret        = secret;
-    this.handshakeDone = false;
-    this.streams       = new Map();
-    this.recvBuffer    = new Uint8Array(0);
-
-    const pair   = new WebSocketPair();
+    const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     server.accept();
-    this.ws    = server;
-    this.alive = true;
+    this.ws = server;
 
-    server.addEventListener('message', (ev: MessageEvent) => {
-      // Cloudflare delivers either ArrayBuffer (binary) or string (text).
-      // We only expect binary frames.
-      const data = ev.data;
-      const buf = typeof data === 'string'
-        ? new TextEncoder().encode(data).buffer
-        : (data as ArrayBuffer);
+    server.addEventListener('message', (ev: MessageEvent) => this.onMessage(ev));
+    server.addEventListener('close', () => this.shutdown(1000, 'client closed'));
+    server.addEventListener('error', () => this.shutdown(1011, 'socket error'));
 
-      this.onClientMessage(buf).catch((err) => {
-        console.error('[ws-msg]', err);
-        this.shutdown('client-error').catch(() => {});
-      });
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      headers: { 'Sec-WebSocket-Protocol': proto },
     });
-
-    server.addEventListener('close', () => {
-      this.shutdown('ws-closed').catch(() => {});
-    });
-
-    server.addEventListener('error', () => {
-      this.shutdown('ws-error').catch(() => {});
-    });
-
-    return new Response(null, { status: 101, webSocket: client });
   }
 
-  // ============================================================
-  // Inbound buffering and frame dispatch
-  // ============================================================
-  private async onClientMessage(data: ArrayBuffer): Promise<void> {
-    const bytes = new Uint8Array(data);
-    this.recvBuffer = concatU8(this.recvBuffer, bytes);
+  // ---------------- inbound ----------------
 
-    if (this.recvBuffer.length > MAX_RECV_BUF) {
-      console.error('[recv] buffer overflow');
-      await this.shutdown('recv-buffer-overflow');
+  private onMessage(ev: MessageEvent): void {
+    if (this.dead) return;
+    if (!(ev.data instanceof ArrayBuffer)) {
+      this.shutdown(1003, 'binary messages only');
       return;
     }
-
-    while (true) {
-      let parsed: { frame: ParsedFrame; consumed: number } | null;
-      try {
-        parsed = parseFrame(this.recvBuffer);
-      } catch (err) {
-        console.error('[parse]', err);
-        await this.shutdown('parse-error');
-        return;
-      }
-
-      if (!parsed) break;
-
-      // Guard against zero-progress loops.
-      if (parsed.consumed === 0) {
-        console.error('[parse] zero-length frame');
-        await this.shutdown('zero-length-frame');
-        return;
-      }
-
-      this.recvBuffer = this.recvBuffer.subarray(parsed.consumed);
-      await this.handleFrame(parsed.frame);
+    let frames: Frame[];
+    try {
+      frames = parseBatch(new Uint8Array(ev.data), 'from-client');
+    } catch {
+      this.shutdown(1002, 'malformed batch');
+      return;
+    }
+    for (const f of frames) {
+      if (this.dead) break;
+      this.onFrame(f);
     }
   }
 
-  // ============================================================
-  // Frame handler
-  // ============================================================
-  private async handleFrame(frame: ParsedFrame): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    // ---- Pre-handshake: HELLO only ----
-    if (!this.handshakeDone) {
-      if (frame.type !== FrameType.HELLO) {
-        this.sendIfOpen(buildClose(0, ERR_BAD_HELLO));
-        throw new Error('Expected HELLO first');
-      }
-
-      const nonce = frame.nonce;
-      if (!nonce || nonce.length !== EXPECTED_NONCE_LEN) {
-        this.sendIfOpen(buildClose(0, ERR_BAD_HELLO));
-        throw new Error(`Bad HELLO nonce length: ${nonce?.length}`);
-      }
-
-      const welcome = await buildWelcome(nonce, this.secret!);
-      this.sendIfOpen(welcome);
-      this.handshakeDone = true;
-      return;
-    }
-
-    // ---- Post-handshake dispatch ----
-    switch (frame.type) {
-      case FrameType.OPEN: {
-        if (this.streams.size >= MAX_STREAMS) {
-          this.sendIfOpen(buildClose(frame.streamId!, ERR_TOO_MANY_STREAMS));
-          break;
-        }
-        await this.openStream(frame.streamId!, frame.dcId!);
+  private onFrame(f: Frame): void {
+    switch (f.type) {
+      case FrameType.OPEN:
+        this.onOpen(f.streamId);
         break;
-      }
-
-      case FrameType.DATA: {
-        const sid = frame.streamId!;
-        const s = this.streams.get(sid);
-        if (!s) break;
-
-        const payload = dataPayload(frame);
-
-        if (payload.length > s.windowSize) {
-          await this.closeStream(sid, ERR_WINDOW_EXCEEDED);
-          break;
-        }
-        s.windowSize -= payload.length;
-
-        try {
-          await s.writer.write(payload);
-        } catch (err) {
-          console.error('[tcp-w]', sid, err);
-          await this.closeStream(sid, ERR_TCP_WRITE);
-        }
+      case FrameType.DATA:
+        this.onData(f);
         break;
-      }
-
-      case FrameType.CLOSE:
-        await this.closeStream(frame.streamId!, 0);
-        break;
-
-      case FrameType.PING:
-        this.sendIfOpen(buildPong());
-        break;
-
       case FrameType.WINDOW: {
-        // Peer granted us additional send credit for this stream.
-        const sid = frame.streamId!;
-        const win = frame.windowSize;
-        const s = this.streams.get(sid);
-        if (s && typeof win === 'number' && win >= 0) {
-          s.windowSize += win;
+        const s = this.find(f.streamId);
+        if (s) {
+          s.sendCredit = Math.min(s.sendCredit + readWindowDelta(f), 0xffffffff);
+          const wake = s.creditWake;
+          s.creditWake = null;
+          wake?.();
         }
         break;
       }
-
-      case FrameType.PONG:
-      case FrameType.WELCOME:
-      default:
-        // Silently ignore unexpected frames.
+      case FrameType.CLOSE: {
+        const s = this.find(f.streamId);
+        if (s) this.closeStream(s, false);
         break;
+      }
+      case FrameType.PONG:
+        break;
+      default:
+        // HELLO belongs to the HTTPS session creation, never to the WebSocket.
+        this.shutdown(1002, 'unexpected frame');
     }
   }
 
-  // ============================================================
-  // Open a TCP stream to a Telegram DC
-  // ============================================================
-  private async openStream(streamId: number, dcId: number): Promise<void> {
-    const addr = DC_ADDRESSES[dcId];
-    if (!addr) {
-      this.sendIfOpen(buildClose(streamId, ERR_UNKNOWN_DC));
+  /** Live stream, or null (late frame for a closed id is ignored; unknown id is fatal). */
+  private find(id: number): StreamState | null {
+    const s = this.streams.get(id);
+    if (s) return s;
+    if (!this.tombstones.has(id)) this.shutdown(1002, 'unknown stream');
+    return null;
+  }
+
+  private onOpen(id: number): void {
+    if (this.streams.has(id) || this.tombstones.has(id)) {
+      this.shutdown(1002, 'stream id reused');
+      return;
+    }
+    if (this.streams.size >= MAX_STREAMS) {
+      this.remember(id);
+      this.send(buildClose(id));
+      return;
+    }
+    this.streams.set(id, {
+      id,
+      closed: false,
+      connected: false,
+      hs: [],
+      hsLen: 0,
+      recvCredit: INITIAL_WINDOW,
+      sendCredit: INITIAL_WINDOW,
+      creditWake: null,
+      uplink: Promise.resolve(),
+      socket: null,
+      writer: null,
+      fromClient: null,
+      toClient: null,
+      dcEnc: null,
+      dcDec: null,
+    });
+  }
+
+  private onData(f: Frame): void {
+    const s = this.find(f.streamId);
+    if (!s) return;
+    const len = f.payload.length;
+    if (len > s.recvCredit) {
+      this.closeStream(s, true); // client overran the window we granted
+      return;
+    }
+    s.recvCredit -= len;
+    const payload = f.payload;
+    s.uplink = s.uplink
+      .then(() => this.processUplink(s, payload))
+      .catch(() => this.closeStream(s, true));
+  }
+
+  // ---------------- client -> DC ----------------
+
+  private async processUplink(s: StreamState, payload: Uint8Array): Promise<void> {
+    if (s.closed) return;
+
+    if (!s.connected) {
+      s.hs.push(payload);
+      s.hsLen += payload.length;
+      if (s.hsLen < INIT_LEN) {
+        this.grant(s, payload.length);
+        return;
+      }
+      const all = concat(...s.hs);
+      s.hs = [];
+      await this.connectStream(s, all.subarray(0, INIT_LEN));
+      if (s.closed) return;
+      if (all.length > INIT_LEN) await this.forwardUp(s, all.subarray(INIT_LEN));
+      this.grant(s, payload.length);
+      return;
+    }
+
+    await this.forwardUp(s, payload);
+    this.grant(s, payload.length);
+  }
+
+  private async forwardUp(s: StreamState, bytes: Uint8Array): Promise<void> {
+    if (s.closed || !s.fromClient || !s.dcEnc || !s.writer) return;
+    const plain = await s.fromClient.process(bytes);
+    const out = await s.dcEnc.process(plain);
+    await s.writer.write(out);
+  }
+
+  private async connectStream(s: StreamState, init: Uint8Array): Promise<void> {
+    let acc;
+    try {
+      acc = await accept(init, this.mtSecret); // fails for a wrong secret: this is the auth check
+    } catch {
+      this.closeStream(s, true);
+      return;
+    }
+    const dc = resolveDc(acc.dcId);
+    if (dc === null) {
+      this.closeStream(s, true);
       return;
     }
 
     let socket: Socket;
     try {
-      socket = connect({ hostname: addr, port: DC_PORT });
-    } catch (err) {
-      console.error('[tcp-c]', streamId, err);
-      this.sendIfOpen(buildClose(streamId, ERR_TCP_CONNECT));
+      socket = connect({ hostname: DC_ADDRESSES[dc], port: DC_PORT });
+      await withTimeout(socket.opened, CONNECT_TIMEOUT_MS);
+    } catch {
+      this.closeStream(s, true);
+      return;
+    }
+    if (s.closed) {
+      Promise.resolve(socket.close()).catch(() => {});
       return;
     }
 
+    const dcSide = await initiate(acc.tag, acc.dcId);
     const writer = socket.writable.getWriter();
-    const reader = socket.readable.getReader();
+    await writer.write(dcSide.wire);
 
-    const stream: Stream = {
-      socket,
-      writer,
-      reader,
-      windowSize: INITIAL_WINDOW,
-      openedAt: Date.now(),
-    };
-    this.streams.set(streamId, stream);
-    console.log(`[stream-open] #${streamId} -> ${addr}:${DC_PORT}`);
+    s.socket = socket;
+    s.writer = writer;
+    s.fromClient = acc.fromClient;
+    s.toClient = acc.toClient;
+    s.dcEnc = dcSide.enc;
+    s.dcDec = dcSide.dec;
+    s.connected = true;
+    if (s.closed) {
+      Promise.resolve(socket.close()).catch(() => {});
+      return;
+    }
+    void this.pumpDown(s, socket.readable.getReader());
+  }
 
-    // ---- TCP -> WebSocket read loop ----
-    (async () => {
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value && value.length > 0) {
-            this.sendIfOpen(buildData(streamId, value));
-          }
-        }
-      } catch (err) {
-        console.error('[tcp-r]', streamId, err);
-      } finally {
-        if (this.streams.get(streamId) === stream) {
-          this.streams.delete(streamId);
-          this.sendIfOpen(buildClose(streamId, 0));
-          console.log(`[stream-close] #${streamId}`);
-        }
-        try { await writer.close(); } catch {}
-        try { reader.releaseLock(); } catch {}
+  // ---------------- DC -> client ----------------
+
+  private async pumpDown(s: StreamState, reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || s.closed) break;
+        if (!value || value.length === 0) continue;
+        const plain = await s.dcDec!.process(value);
+        const out = await s.toClient!.process(plain);
+        await this.sendWithCredit(s, out);
       }
-    })();
-  }
-
-  // ============================================================
-  // Close one stream
-  // ============================================================
-  private async closeStream(streamId: number, code: number): Promise<void> {
-    const s = this.streams.get(streamId);
-    if (!s) return;
-    this.streams.delete(streamId);
-
-    try { await s.writer.close(); } catch {}
-    try { await s.reader.cancel(); } catch {}
-
-    this.sendIfOpen(buildClose(streamId, code));
-  }
-
-  // ============================================================
-  // Full shutdown (WebSocket + all streams)
-  // ============================================================
-  private async shutdown(reason: string): Promise<void> {
-    if (!this.alive) return;
-    this.alive = false;
-    console.log(`[shutdown] ${reason}`);
-
-    for (const [, s] of this.streams) {
-      try { await s.writer.close(); } catch {}
-      try { await s.reader.cancel(); } catch {}
-    }
-    this.streams.clear();
-
-    if (this.ws) {
-      try { this.ws.close(1000, reason.slice(0, 120)); } catch {}
-      this.ws = null;
-    }
-
-    this.handshakeDone = false;
-    this.recvBuffer    = new Uint8Array(0);
-  }
-
-  // ============================================================
-  // Helper: send only if the WebSocket is still open
-  // ============================================================
-  private sendIfOpen(data: Uint8Array | ArrayBuffer): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try { this.ws.send(data); } catch {}
+    } catch {
+      // fall through to close
+    } finally {
+      if (!s.closed) this.closeStream(s, true);
     }
   }
-}
 
-// ============================================================
-// Utility: allocate a fresh Uint8Array with both parts appended.
-// Always returns a new buffer — never aliases the inputs.
-// ============================================================
-function concatU8(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer> {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
+  private async sendWithCredit(s: StreamState, bytes: Uint8Array): Promise<void> {
+    let off = 0;
+    while (off < bytes.length) {
+      while (s.sendCredit <= 0 && !s.closed && !this.dead) {
+        await new Promise<void>((resolve) => { s.creditWake = resolve; });
+      }
+      if (s.closed || this.dead) return;
+      const n = Math.min(MAX_DATA_CHUNK, s.sendCredit, bytes.length - off);
+      this.send(buildData(s.id, bytes.subarray(off, off + n)));
+      s.sendCredit -= n;
+      off += n;
+    }
+  }
+
+  // ---------------- helpers ----------------
+
+  private grant(s: StreamState, n: number): void {
+    if (s.closed || n <= 0) return;
+    s.recvCredit += n;
+    this.send(buildWindow(s.id, n));
+  }
+
+  private send(frame: Uint8Array): void {
+    if (this.dead || !this.ws) return;
+    try { this.ws.send(frame); } catch { /* socket already gone */ }
+  }
+
+  private remember(id: number): void {
+    this.tombstones.add(id);
+    if (this.tombstones.size > MAX_TOMBSTONES) {
+      const oldest = this.tombstones.values().next().value;
+      if (oldest !== undefined) this.tombstones.delete(oldest);
+    }
+  }
+
+  private closeStream(s: StreamState, notifyClient: boolean): void {
+    if (s.closed) return;
+    s.closed = true;
+    this.streams.delete(s.id);
+    this.remember(s.id);
+    const wake = s.creditWake;
+    s.creditWake = null;
+    wake?.();
+    try { if (s.socket) Promise.resolve(s.socket.close()).catch(() => {}); } catch { /* ignore */ }
+    if (notifyClient) this.send(buildClose(s.id));
+  }
+
+  private shutdown(code: number, reason: string): void {
+    if (this.dead) return;
+    this.dead = true;
+    for (const s of [...this.streams.values()]) this.closeStream(s, false);
+    try { this.ws?.close(code, reason); } catch { /* ignore */ }
+    this.ws = null;
+  }
 }
