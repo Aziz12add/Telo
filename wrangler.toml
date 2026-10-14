@@ -3,10 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01" 
 workers_dev = true                 
 
-routes = [
-  { pattern = "proxy.example.com", custom_domain = true }
-]
-
 [[durable_objects.bindings]]
 name = "WEBSOCKET_PROXY"
 class_name = "WebSocketProxy"
