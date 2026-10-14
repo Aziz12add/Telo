@@ -1,239 +1,281 @@
 // ============================================================
-// Telegram WEB Proxy v1 - Binary Frame Codec
-// Big-Endian, HMAC-SHA256 authenticated handshake
+// Telegram WEB proxy v1 - shared frame codec + bridge capability
+// Spec: telegramdesktop/tproxy-server PROTOCOL.md
+//
+// Frame: type:u8 | stream_id:u24 (BE) | payload_length:u32 (BE) | payload
+// All integers are unsigned, big-endian.
 // ============================================================
 
-// ---- Frame Types (regular enum, compatible with isolatedModules) ----
-export enum FrameType {
-  HELLO   = 0x01,
-  WELCOME = 0x02,
-  OPEN    = 0x03,
-  DATA    = 0x04,
-  CLOSE   = 0x05,
-  PING    = 0x06,
-  PONG    = 0x07,
-  WINDOW  = 0x08,
+export const FrameType = {
+  OPEN:    0x01, // client -> relay, stream != 0, empty payload
+  DATA:    0x02, // both,            stream != 0, non-empty opaque payload
+  CLOSE:   0x03, // both,            stream != 0, empty payload (abort)
+  WINDOW:  0x04, // both,            stream != 0, payload = u32 delta (> 0)
+  PING:    0x05, // relay -> client, stream == 0, opaque echo token
+  PONG:    0x06, // client -> relay, stream == 0, exact echo token
+  HELLO:   0x10, // client -> relay, stream == 0, payload = 0x01
+  WELCOME: 0x11, // relay -> client, stream == 0, empty payload
+  BYE:     0x1f, // relay -> client, stream == 0, optional short reason
+} as const;
+export type FrameType = (typeof FrameType)[keyof typeof FrameType];
+
+// ---- Limits from the spec ----
+export const HEADER_LEN = 8;
+export const MAX_PAYLOAD = 1 << 20;            // 1 MiB per frame
+export const MAX_DATA_CHUNK = 64 * 1024;       // relay DATA chunk size
+export const MAX_FRAMES_PER_BATCH = 4096;      // frames per carrier body/message
+export const INITIAL_WINDOW = 4 * 1024 * 1024; // initial credit per stream/direction
+export const MAX_STREAM_ID = 0xffffff;         // u24
+
+const EMPTY = new Uint8Array(0);
+const KNOWN_TYPES = new Set<number>(Object.values(FrameType));
+
+export interface Frame {
+  type: FrameType;
+  streamId: number;
+  payload: Uint8Array; // a view into the input buffer (not a copy)
 }
 
-// ---- Constants ----
-// NOTE: MTProto uses 128-bit (16-byte) nonce in HELLO/WELCOME.
-// If your reference implementation uses 32 bytes, change this back.
-const NONCE_LEN = 16;
-const HMAC_LEN  = 32;               // SHA-256 output
-const MAX_PAYLOAD = 1 << 20;        // 1 MiB safety cap
-
-// ---- Helpers (Big-Endian) ----
-const beU32 = (v: number): Uint8Array => {
-  const b = new Uint8Array(4);
-  new DataView(b.buffer).setUint32(0, v, false);
-  return b;
-};
-
-const readU32 = (b: Uint8Array, o: number): number => {
-  if (o + 4 > b.length) throw new Error('readU32: out of bounds');
-  return new DataView(b.buffer, b.byteOffset + o).getUint32(0, false);
-};
-
-const concat = (...arrs: Uint8Array[]): Uint8Array => {
-  const total = arrs.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const a of arrs) { out.set(a, off); off += a.length; }
+// ============================================================
+// Encoding
+// ============================================================
+const encode = (
+  type: FrameType,
+  streamId: number,
+  payload: Uint8Array = EMPTY
+): Uint8Array => {
+  if (!Number.isInteger(streamId) || streamId < 0 || streamId > MAX_STREAM_ID) {
+    throw new RangeError(`stream id out of range: ${streamId}`);
+  }
+  if (payload.length > MAX_PAYLOAD) {
+    throw new RangeError(`payload too large: ${payload.length}`);
+  }
+  const out = new Uint8Array(HEADER_LEN + payload.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint8(0, type);
+  dv.setUint8(1, (streamId >>> 16) & 0xff);
+  dv.setUint8(2, (streamId >>> 8) & 0xff);
+  dv.setUint8(3, streamId & 0xff);
+  dv.setUint32(4, payload.length, false);
+  out.set(payload, HEADER_LEN);
   return out;
 };
 
-// ---- Random ----
-export const randomBytes = (n: number): Uint8Array =>
-  crypto.getRandomValues(new Uint8Array(n));
+export const buildHello = (): Uint8Array =>
+  encode(FrameType.HELLO, 0, Uint8Array.of(0x01));
 
-// ---- HMAC-SHA256 ----
+export const buildWelcome = (): Uint8Array => encode(FrameType.WELCOME, 0);
+
+export const buildOpen = (streamId: number): Uint8Array =>
+  encode(FrameType.OPEN, requireStream(streamId));
+
+export const buildData = (streamId: number, payload: Uint8Array): Uint8Array => {
+  if (payload.length === 0) throw new RangeError('DATA payload must be non-empty');
+  return encode(FrameType.DATA, requireStream(streamId), payload);
+};
+
+/** Split a large buffer into DATA frames of at most 64 KiB each. */
+export const buildDataChunks = (
+  streamId: number,
+  payload: Uint8Array
+): Uint8Array[] => {
+  const frames: Uint8Array[] = [];
+  for (let o = 0; o < payload.length; o += MAX_DATA_CHUNK) {
+    frames.push(buildData(streamId, payload.subarray(o, o + MAX_DATA_CHUNK)));
+  }
+  return frames;
+};
+
+export const buildClose = (streamId: number): Uint8Array =>
+  encode(FrameType.CLOSE, requireStream(streamId));
+
+export const buildWindow = (streamId: number, delta: number): Uint8Array => {
+  if (!Number.isInteger(delta) || delta <= 0 || delta > 0xffffffff) {
+    throw new RangeError(`WINDOW delta must be a positive u32: ${delta}`);
+  }
+  const p = new Uint8Array(4);
+  new DataView(p.buffer).setUint32(0, delta, false);
+  return encode(FrameType.WINDOW, requireStream(streamId), p);
+};
+
+export const buildPing = (token: Uint8Array): Uint8Array =>
+  encode(FrameType.PING, 0, token);
+
+export const buildPong = (token: Uint8Array): Uint8Array =>
+  encode(FrameType.PONG, 0, token);
+
+export const buildBye = (reason: Uint8Array = EMPTY): Uint8Array =>
+  encode(FrameType.BYE, 0, reason);
+
+const requireStream = (id: number): number => {
+  if (id === 0) throw new RangeError('stream id must be non-zero');
+  return id;
+};
+
+// ============================================================
+// Parsing
+// ============================================================
+
+/**
+ * Parse one frame at `offset`. Returns null if the buffer does not yet hold a
+ * complete frame (streaming use). Throws on malformed headers.
+ */
+export const parseFrame = (
+  buf: Uint8Array,
+  offset = 0
+): { frame: Frame; consumed: number } | null => {
+  if (buf.length - offset < HEADER_LEN) return null;
+
+  const dv = new DataView(buf.buffer, buf.byteOffset + offset, HEADER_LEN);
+  const type = dv.getUint8(0);
+  const streamId =
+    (dv.getUint8(1) << 16) | (dv.getUint8(2) << 8) | dv.getUint8(3);
+  const len = dv.getUint32(4, false);
+
+  if (!KNOWN_TYPES.has(type)) {
+    throw new Error(`unknown frame type 0x${type.toString(16)}`);
+  }
+  if (len > MAX_PAYLOAD) throw new Error(`frame too large: ${len}`);
+
+  const total = HEADER_LEN + len;
+  if (buf.length - offset < total) return null;
+
+  return {
+    frame: {
+      type: type as FrameType,
+      streamId,
+      payload: buf.subarray(offset + HEADER_LEN, offset + total),
+    },
+    consumed: total,
+  };
+};
+
+export type Origin = 'from-client' | 'from-relay';
+
+const FROM_CLIENT = new Set<number>([
+  FrameType.OPEN, FrameType.DATA, FrameType.CLOSE,
+  FrameType.WINDOW, FrameType.PONG, FrameType.HELLO,
+]);
+const FROM_RELAY = new Set<number>([
+  FrameType.DATA, FrameType.CLOSE, FrameType.WINDOW,
+  FrameType.PING, FrameType.WELCOME, FrameType.BYE,
+]);
+
+/** Enforce the per-type rules of the spec's frame table. Throws on violation. */
+export const validateFrame = (f: Frame, origin: Origin): void => {
+  const allowed = origin === 'from-client' ? FROM_CLIENT : FROM_RELAY;
+  if (!allowed.has(f.type)) {
+    throw new Error(`frame type 0x${f.type.toString(16)} not allowed ${origin}`);
+  }
+  const zeroStream = f.streamId === 0;
+  switch (f.type) {
+    case FrameType.OPEN:
+    case FrameType.CLOSE:
+      if (zeroStream || f.payload.length !== 0) throw new Error('bad OPEN/CLOSE');
+      break;
+    case FrameType.DATA:
+      if (zeroStream || f.payload.length === 0) throw new Error('bad DATA');
+      break;
+    case FrameType.WINDOW:
+      if (zeroStream || f.payload.length !== 4 || readWindowDelta(f) === 0) {
+        throw new Error('bad WINDOW');
+      }
+      break;
+    case FrameType.PING:
+    case FrameType.PONG:
+    case FrameType.BYE:
+      if (!zeroStream) throw new Error('PING/PONG/BYE must use stream 0');
+      break;
+    case FrameType.HELLO:
+      if (!zeroStream || f.payload.length !== 1 || f.payload[0] !== 0x01) {
+        throw new Error('bad HELLO');
+      }
+      break;
+    case FrameType.WELCOME:
+      if (!zeroStream || f.payload.length !== 0) throw new Error('bad WELCOME');
+      break;
+  }
+};
+
+export const readWindowDelta = (f: Frame): number =>
+  new DataView(f.payload.buffer, f.payload.byteOffset, 4).getUint32(0, false);
+
+/**
+ * Parse a complete carrier batch (one WebSocket binary message / HTTP body).
+ * Every byte must belong to a complete, valid frame.
+ */
+export const parseBatch = (buf: Uint8Array, origin: Origin): Frame[] => {
+  const frames: Frame[] = [];
+  let off = 0;
+  while (off < buf.length) {
+    const r = parseFrame(buf, off);
+    if (!r) throw new Error('truncated frame in batch');
+    validateFrame(r.frame, origin);
+    frames.push(r.frame);
+    if (frames.length > MAX_FRAMES_PER_BATCH) throw new Error('too many frames');
+    off += r.consumed;
+  }
+  return frames;
+};
+
+export const concat = (...arrs: Uint8Array[]): Uint8Array => {
+  const out = new Uint8Array(arrs.reduce((s, a) => s + a.length, 0));
+  let o = 0;
+  for (const a of arrs) { out.set(a, o); o += a.length; }
+  return out;
+};
+
+// ============================================================
+// Secret + bridge capability
+// ============================================================
+
+/**
+ * Client-facing secret: 32 hex chars (16 bytes), or "dd" + 32 hex chars when
+ * random-padding mode is selected. The leading dd byte is KEPT in the bytes.
+ */
+export const decodeSecret = (hex: string): Uint8Array => {
+  if (!/^(dd)?[0-9a-fA-F]{32}$/.test(hex)) {
+    throw new Error('secret must be 32 hex chars, optionally prefixed with dd');
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+};
+
 export const hmacSha256 = async (
   key: Uint8Array,
   data: Uint8Array
 ): Promise<Uint8Array> => {
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  const k = await crypto.subtle.importKey(
+    'raw', key as BufferSource, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
   );
-  const sig = await crypto.subtle.sign('HMAC', cryptoKey, data);
-  return new Uint8Array(sig);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, data as BufferSource));
 };
 
-// ---- Secret Decoding ----
-// Telegram sends secret as 32-char hex string (16 raw bytes).
-export const decodeSecret = (hex: string): Uint8Array => {
-  if (!/^[0-9a-fA-F]{32}$/.test(hex)) {
-    throw new Error('Secret must be 32 hex chars');
-  }
-  const out = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return out;
+const b64url = (b: Uint8Array): string => {
+  let s = '';
+  for (const x of b) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 };
 
-// ---- Frame Header ----
-// [length: u32 BE][type: u32 BE][payload...]
-// length = payload length (NOT including 8-byte header)
-const frame = (type: FrameType, payload: Uint8Array): Uint8Array => {
-  if (payload.length > MAX_PAYLOAD) {
-    throw new Error(`Payload too large: ${payload.length}`);
-  }
-  return concat(beU32(payload.length), beU32(type), payload);
+/** URL is https://H/?bridge=<capability>. H = canonical lowercase ASCII/IDNA host. */
+export const bridgeCapability = async (
+  secret: Uint8Array,
+  hostname: string
+): Promise<string> => {
+  const host = new URL(`https://${hostname}`).hostname; // lowercases + punycode
+  const ctx = new TextEncoder().encode(`tdesktop-web-proxy-bridge-v1\n${host}`);
+  return b64url(await hmacSha256(secret, ctx));
 };
 
-// ============================================================
-// Frame Builders
-// ============================================================
-export const buildHello = (nonce: Uint8Array): Uint8Array =>
-  frame(FrameType.HELLO, nonce);
-
-// WELCOME = [client_nonce][server_nonce][hmac:32]
-// HMAC key = secret, data = client_nonce || server_nonce
-export const buildWelcome = async (
-  clientNonce: Uint8Array,
-  secret: Uint8Array
-): Promise<Uint8Array> => {
-  if (clientNonce.length !== NONCE_LEN) {
-    throw new Error(`Invalid HELLO nonce length: ${clientNonce.length}`);
-  }
-  const serverNonce = randomBytes(NONCE_LEN);
-  const hmac = await hmacSha256(secret, concat(clientNonce, serverNonce));
-  return frame(
-    FrameType.WELCOME,
-    concat(clientNonce, serverNonce, hmac)
-  );
+/** Constant-time string comparison (e.g. for the ?bridge= parameter). */
+export const safeEqual = (a: string, b: string): boolean => {
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  let diff = ea.length ^ eb.length;
+  const n = Math.max(ea.length, eb.length);
+  for (let i = 0; i < n; i++) diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0);
+  return diff === 0;
 };
-
-export const buildOpen = (
-  streamId: number,
-  dcId: number,
-  payload: Uint8Array = new Uint8Array(0)
-): Uint8Array =>
-  frame(FrameType.OPEN, concat(beU32(streamId), beU32(dcId), payload));
-
-export const buildData = (
-  streamId: number,
-  payload: Uint8Array
-): Uint8Array =>
-  frame(FrameType.DATA, concat(beU32(streamId), payload));
-
-export const buildClose = (
-  streamId: number,
-  errorCode: number = 0
-): Uint8Array =>
-  frame(FrameType.CLOSE, concat(beU32(streamId), beU32(errorCode)));
-
-export const buildPing = (): Uint8Array =>
-  frame(FrameType.PING, new Uint8Array(0));
-
-export const buildPong = (): Uint8Array =>
-  frame(FrameType.PONG, new Uint8Array(0));
-
-export const buildWindow = (
-  streamId: number,
-  windowSize: number
-): Uint8Array =>
-  frame(FrameType.WINDOW, concat(beU32(streamId), beU32(windowSize)));
-
-// ============================================================
-// Frame Parser
-// ============================================================
-export interface ParsedFrame {
-  type: FrameType;
-  payload: Uint8Array;
-  streamId?: number;
-  dcId?: number;
-  nonce?: Uint8Array;
-  serverNonce?: Uint8Array;
-  hmac?: Uint8Array;
-  errorCode?: number;
-  windowSize?: number;
-}
-
-export const parseFrame = (
-  buf: Uint8Array
-): { frame: ParsedFrame; consumed: number } | null => {
-  if (buf.length < 8) return null;
-
-  const payloadLen = readU32(buf, 0);
-  if (payloadLen > MAX_PAYLOAD) {
-    throw new Error(`Frame too large: ${payloadLen}`);
-  }
-  const type = readU32(buf, 4);
-  const total = 8 + payloadLen;
-  if (buf.length < total) return null;
-
-  const payload = buf.subarray(8, total);
-  const out: ParsedFrame = { type, payload };
-
-  switch (type) {
-    case FrameType.HELLO:
-      if (payload.length < NONCE_LEN) {
-        throw new Error('HELLO payload too short');
-      }
-      out.nonce = payload.subarray(0, NONCE_LEN);
-      break;
-
-    case FrameType.WELCOME:
-      if (payload.length < NONCE_LEN * 2 + HMAC_LEN) {
-        throw new Error('WELCOME payload too short');
-      }
-      out.nonce       = payload.subarray(0, NONCE_LEN);
-      out.serverNonce = payload.subarray(NONCE_LEN, NONCE_LEN * 2);
-      out.hmac        = payload.subarray(NONCE_LEN * 2, NONCE_LEN * 2 + HMAC_LEN);
-      break;
-
-    case FrameType.OPEN:
-      if (payload.length < 8) throw new Error('OPEN payload too short');
-      out.streamId = readU32(payload, 0);
-      out.dcId     = readU32(payload, 4);
-      break;
-
-    case FrameType.DATA:
-      if (payload.length < 4) throw new Error('DATA payload too short');
-      out.streamId = readU32(payload, 0);
-      break;
-
-    case FrameType.CLOSE:
-      if (payload.length < 8) throw new Error('CLOSE payload too short');
-      out.streamId  = readU32(payload, 0);
-      out.errorCode = readU32(payload, 4);
-      break;
-
-    case FrameType.WINDOW:
-      if (payload.length < 8) throw new Error('WINDOW payload too short');
-      out.streamId   = readU32(payload, 0);
-      out.windowSize = readU32(payload, 4);
-      break;
-
-    case FrameType.PING:
-    case FrameType.PONG:
-      break;
-
-    default:
-      throw new Error(`Unknown frame type: 0x${type.toString(16)}`);
-  }
-  return { frame: out, consumed: total };
-};
-
-// Strip stream_id from DATA payload
-export const dataPayload = (f: ParsedFrame): Uint8Array => {
-  if (f.type !== FrameType.DATA) {
-    throw new Error('dataPayload called on non-DATA frame');
-  }
-  return f.payload.subarray(4);
-};
-
-// ============================================================
-// Telegram DC Addresses
-// ============================================================
-export const DC_ADDRESSES: Record<number, string> = {
-  1: '149.154.175.50',
-  2: '149.154.167.51',
-  3: '149.154.175.100',
-  4: '149.154.167.91',
-  5: '91.108.56.130',
-};
-
-export const DC_PORT = 443;
-export const VALID_DC_IDS = [1, 2, 3, 4, 5] as const;
