@@ -108,7 +108,7 @@ export class WebSocketProxy implements DurableObject {
     // With recent compatibility dates binary messages default to Blob; ask for ArrayBuffer.
     (server as unknown as { binaryType: string }).binaryType = 'arraybuffer';
     this.ws = server;
-    log('attached');
+    log('attached (build 2: binary-message fix)');
 
     server.addEventListener('message', (ev: MessageEvent) => this.onMessage(ev));
     server.addEventListener('close', (ev: CloseEvent) => {
@@ -136,7 +136,7 @@ export class WebSocketProxy implements DurableObject {
       if (this.dead) return;
       const buf = await this.toArrayBuffer(data);
       if (!buf) {
-        log('non-binary message:', typeof data);
+        log('non-binary message:', Object.prototype.toString.call(data), String((data as { constructor?: { name?: string } } | null)?.constructor?.name));
         this.shutdown(1003, 'binary messages only');
         return;
       }
@@ -148,11 +148,14 @@ export class WebSocketProxy implements DurableObject {
   }
 
   private async toArrayBuffer(data: unknown): Promise<ArrayBuffer | null> {
-    if (data instanceof ArrayBuffer) return data;
+    const tag = Object.prototype.toString.call(data);
+    if (data instanceof ArrayBuffer || tag === '[object ArrayBuffer]') return data as ArrayBuffer;
     if (ArrayBuffer.isView(data)) {
       return new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength).slice().buffer;
     }
-    if (typeof Blob !== 'undefined' && data instanceof Blob) return data.arrayBuffer();
+    // Blob (duck-typed so it also works across runtime realms)
+    const blobLike = data as { arrayBuffer?: () => Promise<ArrayBuffer> } | null;
+    if (blobLike && typeof blobLike.arrayBuffer === 'function') return blobLike.arrayBuffer();
     return null;
   }
 
