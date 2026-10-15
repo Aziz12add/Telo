@@ -67,23 +67,28 @@ const bridgeResponse = async (host: string, bootstrap: string): Promise<Response
 };
 
 const createSession = async (req: Request, secret: Uint8Array): Promise<Response> => {
-  if (req.headers.has('Cookie')) return notFound();
+  if (req.headers.has('Cookie')) { console.log('[w] session: rejected (cookie)'); return notFound(); }
   const token = bearer(req);
-  if (!token) return notFound();
+  if (!token) { console.log('[w] session: no/invalid bearer'); return notFound(); }
   const boot = await verifyBootstrap(secret, token);
-  if (!boot) return notFound();
+  if (!boot) { console.log('[w] session: bootstrap invalid/expired'); return notFound(); }
 
   const declared = Number(req.headers.get('Content-Length') ?? '0');
-  if (!(declared >= 8 && declared <= 64)) return notFound();
+  if (!(declared >= 8 && declared <= 64)) { console.log('[w] session: bad content-length', declared); return notFound(); }
   const body = new Uint8Array(await req.arrayBuffer());
   try {
     const frames = parseBatch(body, 'from-client');
-    if (frames.length !== 1 || frames[0].type !== FrameType.HELLO) return notFound();
-  } catch {
+    if (frames.length !== 1 || frames[0].type !== FrameType.HELLO) {
+      console.log('[w] session: body is not a single HELLO');
+      return notFound();
+    }
+  } catch (e) {
+    console.log('[w] session: body parse failed:', String(e), 'len', body.length);
     return notFound();
   }
 
   const session = await deriveSession(secret, boot);
+  console.log('[w] session created');
   return new Response(buildWelcome() as Uint8Array<ArrayBuffer>, {
     status: 200,
     headers: {
@@ -113,8 +118,10 @@ export default {
     if (url.pathname === '/' && method === 'GET') {
       const m = /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search);
       if (m && safeEqual(m[1], await bridgeCapability(secret, url.hostname))) {
+        console.log('[w] bridge page served');
         return bridgeResponse(url.hostname, await mintBootstrap(secret));
       }
+      if (url.search) console.log('[w] / with bad bridge capability for host', url.hostname);
       return publicHome();
     }
 
@@ -132,11 +139,15 @@ export default {
     }
 
     if (url.pathname === '/api/v1/ws' && method === 'GET') {
-      if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return notFound();
+      if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+        console.log('[w] ws: no Upgrade header, protocol', request.headers.get('X-Forwarded-Proto'));
+        return notFound();
+      }
       const offered = (request.headers.get('Sec-WebSocket-Protocol') ?? '')
         .split(',').map((p) => p.trim()).find((p) => p.startsWith('tproxy-v1.'));
       const sid = offered ? await verifySession(secret, offered.slice('tproxy-v1.'.length)) : null;
-      if (!sid) return notFound();
+      if (!sid) { console.log('[w] ws: subprotocol/token invalid', offered ? 'present' : 'missing'); return notFound(); }
+      console.log('[w] ws: forwarding to session DO');
       const stub = env.WEBSOCKET_PROXY.get(env.WEBSOCKET_PROXY.idFromName(sid));
       return stub.fetch(request);
     }
