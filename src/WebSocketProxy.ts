@@ -31,6 +31,9 @@ const MAX_TOMBSTONES = 4096;     // remembered closed ids (never reusable)
 const CONNECT_TIMEOUT_MS = 10_000;
 const INIT_LEN = 64;
 
+// Diagnostics only: never log secrets, tokens or payload bytes.
+const log = (...a: unknown[]): void => console.log('[do]', ...a);
+
 interface StreamState {
   id: number;
   closed: boolean;
@@ -70,6 +73,7 @@ export class WebSocketProxy implements DurableObject {
   private dead = false;
   private streams = new Map<number, StreamState>();
   private tombstones = new Set<number>();
+  private msgCount = 0;
 
   constructor(_state: DurableObjectState, env: Env) {
     this.mtSecret = mtproxySecret(decodeSecret(env.PROXY_SECRET));
@@ -88,7 +92,10 @@ export class WebSocketProxy implements DurableObject {
       return new Response('Expected WebSocket', { status: 426 });
     }
     // One multiplexed WebSocket per session; a dead session is never resumed.
-    if (this.dead || this.ws) return new Response('Session unavailable', { status: 409 });
+    if (this.dead || this.ws) {
+      log('attach refused:', this.dead ? 'session dead' : 'already attached');
+      return new Response('Session unavailable', { status: 409 });
+    }
 
     const proto = pickSubprotocol(request.headers.get('Sec-WebSocket-Protocol'));
     if (!proto) return new Response('Bad subprotocol', { status: 400 });
@@ -98,10 +105,17 @@ export class WebSocketProxy implements DurableObject {
     const server = pair[1];
     server.accept();
     this.ws = server;
+    log('attached');
 
     server.addEventListener('message', (ev: MessageEvent) => this.onMessage(ev));
-    server.addEventListener('close', () => this.shutdown(1000, 'client closed'));
-    server.addEventListener('error', () => this.shutdown(1011, 'socket error'));
+    server.addEventListener('close', (ev: CloseEvent) => {
+      log('ws close event: code', ev.code, 'reason', ev.reason);
+      this.shutdown(1000, 'client closed');
+    });
+    server.addEventListener('error', () => {
+      log('ws error event');
+      this.shutdown(1011, 'socket error');
+    });
 
     return new Response(null, {
       status: 101,
@@ -115,15 +129,20 @@ export class WebSocketProxy implements DurableObject {
   private onMessage(ev: MessageEvent): void {
     if (this.dead) return;
     if (!(ev.data instanceof ArrayBuffer)) {
+      log('non-binary message:', typeof ev.data);
       this.shutdown(1003, 'binary messages only');
       return;
     }
     let frames: Frame[];
     try {
       frames = parseBatch(new Uint8Array(ev.data), 'from-client');
-    } catch {
+    } catch (e) {
+      log('malformed batch:', String(e), 'bytes', ev.data.byteLength);
       this.shutdown(1002, 'malformed batch');
       return;
+    }
+    if (this.msgCount++ < 40) {
+      log('batch', frames.map((f) => `0x${f.type.toString(16)}#${f.streamId}/${f.payload.length}`).join(' '));
     }
     for (const f of frames) {
       if (this.dead) break;
@@ -158,6 +177,7 @@ export class WebSocketProxy implements DurableObject {
         break;
       default:
         // HELLO belongs to the HTTPS session creation, never to the WebSocket.
+        log('unexpected frame type 0x' + f.type.toString(16));
         this.shutdown(1002, 'unexpected frame');
     }
   }
@@ -166,12 +186,16 @@ export class WebSocketProxy implements DurableObject {
   private find(id: number): StreamState | null {
     const s = this.streams.get(id);
     if (s) return s;
-    if (!this.tombstones.has(id)) this.shutdown(1002, 'unknown stream');
+    if (!this.tombstones.has(id)) {
+      log('frame for unknown stream', id);
+      this.shutdown(1002, 'unknown stream');
+    }
     return null;
   }
 
   private onOpen(id: number): void {
     if (this.streams.has(id) || this.tombstones.has(id)) {
+      log('stream id reused', id);
       this.shutdown(1002, 'stream id reused');
       return;
     }
@@ -250,12 +274,14 @@ export class WebSocketProxy implements DurableObject {
     let acc;
     try {
       acc = await accept(init, this.mtSecret); // fails for a wrong secret: this is the auth check
-    } catch {
+    } catch (e) {
+      log('stream', s.id, 'init rejected:', String(e));
       this.closeStream(s, true);
       return;
     }
     const dc = resolveDc(acc.dcId);
     if (dc === null) {
+      log('stream', s.id, 'bad dc id', acc.dcId);
       this.closeStream(s, true);
       return;
     }
@@ -264,7 +290,8 @@ export class WebSocketProxy implements DurableObject {
     try {
       socket = connect({ hostname: DC_ADDRESSES[dc], port: DC_PORT });
       await withTimeout(socket.opened, CONNECT_TIMEOUT_MS);
-    } catch {
+    } catch (e) {
+      log('stream', s.id, 'connect to dc', dc, 'failed:', String(e));
       this.closeStream(s, true);
       return;
     }
@@ -284,6 +311,7 @@ export class WebSocketProxy implements DurableObject {
     s.dcEnc = dcSide.enc;
     s.dcDec = dcSide.dec;
     s.connected = true;
+    log('stream', s.id, 'connected: dc', dc, 'tag 0x' + acc.tag[0].toString(16));
     if (s.closed) {
       Promise.resolve(socket.close()).catch(() => {});
       return;
@@ -334,7 +362,7 @@ export class WebSocketProxy implements DurableObject {
 
   private send(frame: Uint8Array): void {
     if (this.dead || !this.ws) return;
-    try { this.ws.send(frame); } catch { /* socket already gone */ }
+    try { this.ws.send(frame as Uint8Array<ArrayBuffer>); } catch { /* socket already gone */ }
   }
 
   private remember(id: number): void {
@@ -348,6 +376,7 @@ export class WebSocketProxy implements DurableObject {
   private closeStream(s: StreamState, notifyClient: boolean): void {
     if (s.closed) return;
     s.closed = true;
+    log('stream', s.id, 'closed', notifyClient ? '(by relay)' : '(by client)');
     this.streams.delete(s.id);
     this.remember(s.id);
     const wake = s.creditWake;
@@ -360,6 +389,7 @@ export class WebSocketProxy implements DurableObject {
   private shutdown(code: number, reason: string): void {
     if (this.dead) return;
     this.dead = true;
+    log('shutdown:', code, reason);
     for (const s of [...this.streams.values()]) this.closeStream(s, false);
     try { this.ws?.close(code, reason); } catch { /* ignore */ }
     this.ws = null;
