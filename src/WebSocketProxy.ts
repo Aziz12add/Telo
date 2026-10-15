@@ -74,6 +74,7 @@ export class WebSocketProxy implements DurableObject {
   private streams = new Map<number, StreamState>();
   private tombstones = new Set<number>();
   private msgCount = 0;
+  private inbox: Promise<void> = Promise.resolve(); // keeps message order while converting Blob -> ArrayBuffer
 
   constructor(_state: DurableObjectState, env: Env) {
     this.mtSecret = mtproxySecret(decodeSecret(env.PROXY_SECRET));
@@ -104,6 +105,8 @@ export class WebSocketProxy implements DurableObject {
     const client = pair[0];
     const server = pair[1];
     server.accept();
+    // With recent compatibility dates binary messages default to Blob; ask for ArrayBuffer.
+    (server as unknown as { binaryType: string }).binaryType = 'arraybuffer';
     this.ws = server;
     log('attached');
 
@@ -127,17 +130,38 @@ export class WebSocketProxy implements DurableObject {
   // ---------------- inbound ----------------
 
   private onMessage(ev: MessageEvent): void {
-    if (this.dead) return;
-    if (!(ev.data instanceof ArrayBuffer)) {
-      log('non-binary message:', typeof ev.data);
-      this.shutdown(1003, 'binary messages only');
-      return;
+    const data: unknown = ev.data;
+    // Always go through one chain so ordering holds even if some messages need an async Blob read.
+    this.inbox = this.inbox.then(async () => {
+      if (this.dead) return;
+      const buf = await this.toArrayBuffer(data);
+      if (!buf) {
+        log('non-binary message:', typeof data);
+        this.shutdown(1003, 'binary messages only');
+        return;
+      }
+      this.handleBatch(buf);
+    }).catch((e) => {
+      log('inbound error:', String(e));
+      this.shutdown(1011, 'internal error');
+    });
+  }
+
+  private async toArrayBuffer(data: unknown): Promise<ArrayBuffer | null> {
+    if (data instanceof ArrayBuffer) return data;
+    if (ArrayBuffer.isView(data)) {
+      return new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength).slice().buffer;
     }
+    if (typeof Blob !== 'undefined' && data instanceof Blob) return data.arrayBuffer();
+    return null;
+  }
+
+  private handleBatch(buf: ArrayBuffer): void {
     let frames: Frame[];
     try {
-      frames = parseBatch(new Uint8Array(ev.data), 'from-client');
+      frames = parseBatch(new Uint8Array(buf), 'from-client');
     } catch (e) {
-      log('malformed batch:', String(e), 'bytes', ev.data.byteLength);
+      log('malformed batch:', String(e), 'bytes', buf.byteLength);
       this.shutdown(1002, 'malformed batch');
       return;
     }
